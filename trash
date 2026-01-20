@@ -1,0 +1,80 @@
+#!/bin/bash
+
+# --- CONFIGURATION ---
+TRASH_DIR="/trash"
+mkdir -p "$TRASH_DIR"
+
+# --- 1. PERFORMANCE & BYPASS CHECKS ---
+
+# If NO_TRASH environment variable is set, use real rm immediately.
+if [ -n "$NO_TRASH" ]; then
+    exec /bin/rm "$@"
+fi
+
+# Scan arguments for "build junk" to auto-bypass trash during compiles.
+# If we see common temp files, we assume this is a script/build process and use real rm.
+junk_count=0
+arg_count=0
+
+for arg in "$@"; do
+    [[ "$arg" == -* ]] && continue # Skip flags
+    ((arg_count++))
+    
+    case "$arg" in
+        *.o|*.obj|*.class|*.log|*.tmp|*.swp|*~) ((junk_count++)) ;;
+        node_modules|__pycache__|.DS_Store|.git) ((junk_count++)) ;;
+    esac
+done
+
+# If every single file argument looks like junk, use real rm (Speed: 100%)
+if [ "$arg_count" -gt 0 ] && [ "$arg_count" -eq "$junk_count" ]; then
+    exec /bin/rm "$@"
+fi
+
+# --- 2. ARGUMENT PARSING ---
+
+files_to_trash=()
+force=false
+use_real_rm=false
+
+for arg in "$@"; do
+    case "$arg" in
+        --help|--version) use_real_rm=true; break ;;
+        -f|--force) force=true ;;
+        -i|-v|-I|--interactive|--verbose) continue ;; # Ignore these flags
+        -r|-R|--recursive) continue ;;                # Ignore these flags
+        -*) use_real_rm=true; break ;;                # Unknown flag? Use real rm
+        *) files_to_trash+=("$arg") ;;
+    esac
+done
+
+# If flags like --help were used, or no files given, pass through to real rm
+if [ "$use_real_rm" = true ] || [ ${#files_to_trash[@]} -eq 0 ]; then
+    exec /bin/rm "$@"
+fi
+
+# --- 3. THE TRASH LOGIC ---
+
+for file in "${files_to_trash[@]}"; do
+    # Check if source file exists
+    if [ ! -e "$file" ]; then
+        # Only print error if force (-f) is NOT used
+        if [ "$force" = false ]; then
+            echo "rm: cannot remove '$file': No such file or directory"
+        fi
+        continue
+    fi
+
+    # Get the filename (using bash string manipulation for speed)
+    base_name="${file##*/}"
+    
+    # Check for name collision in trash
+    if [ -e "$TRASH_DIR/$base_name" ]; then
+        # Conflict: Add random suffix
+        random_suffix=$(mktemp -u XXXXXXXXXXXX)
+        mv "$file" "$TRASH_DIR/${base_name}-${random_suffix}"
+    else
+        # No Conflict: Move cleanly
+        mv "$file" "$TRASH_DIR/"
+    fi
+done
