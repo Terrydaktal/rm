@@ -1,51 +1,185 @@
 #!/bin/bash
+set -euo pipefail
 
-# --- CONFIGURATION ---
-TRASH_DIR="/trash"
-mkdir -p "$TRASH_DIR"
+# Trash-per-mountpoint:
+#   For each file, move it to:  <that file's filesystem mountpoint>/trash/
+# Examples:
+#   /home/lewis/foo.txt   -> /home/trash/foo.txt
+#   /mnt/U1/bar.txt       -> /mnt/U1/trash/bar.txt
+#   /etc/hosts            -> /trash/hosts            (because mountpoint is "/")
+#
+# Collision suffix (timestamp + ns + pid):
+#   ts="$(date +%Y%m%d-%H%M%S-%N)-$$"
+#
+# Notes:
+# - Uses mv -n (no clobber) to avoid overwrites.
+# - Optimistic move first (fast path), only does extra checks on failure.
+# - Broken symlinks are handled (mv moves the symlink itself).
 
-files_to_trash=()
+# --- CONFIG ---
+TRASH_SUBDIR="${TRASH_SUBDIR:-trash}"   # name of trash directory at mountpoint (default: "trash")
+
 force=false
 use_real_rm=false
+files_to_trash=()
 
-# --- 1. PARSE ARGUMENTS ---
-for arg in "$@"; do
-    case "$arg" in
-        --help|--version) use_real_rm=true; break ;;
-        -f|--force) force=true ;;
-        -i|-v|-I|--interactive|--verbose) continue ;; 
-        -r|-R|--recursive) continue ;;                
-        -*) use_real_rm=true; break ;;                
-        *) files_to_trash+=("$arg") ;;
+orig_argv=("$@")
+
+# --- 1) PARSE ARGUMENTS (robust) ---
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --help|--version)
+            use_real_rm=true
+            break
+            ;;
+        -f|--force)
+            force=true
+            shift
+            ;;
+        -i|-v|-I|--interactive|--verbose|-r|-R|--recursive)
+            # accepted but ignored; behaviour is "trash", not full rm emulation
+            shift
+            ;;
+        --)
+            shift
+            # everything after -- is a path
+            while [ $# -gt 0 ]; do
+                files_to_trash+=("$1")
+                shift
+            done
+            ;;
+        -*)
+            # unknown option => fall back to real rm for correctness
+            use_real_rm=true
+            break
+            ;;
+        *)
+            files_to_trash+=("$1")
+            shift
+            ;;
     esac
 done
 
-# If flags like --help were used, or no files given, pass through to real rm
+# If passing through, do it with the original arguments
 if [ "$use_real_rm" = true ] || [ ${#files_to_trash[@]} -eq 0 ]; then
-    exec /bin/rm "$@"
+    exec /bin/rm "${orig_argv[@]}"
 fi
 
-# --- 2. MOVE TO TRASH ---
-for file in "${files_to_trash[@]}"; do
-    # Check if source file exists
-    if [ ! -e "$file" ]; then
-        # Only print error if force (-f) is NOT used
-        if [ "$force" = false ]; then
-            echo "rm: cannot remove '$file': No such file or directory"
-        fi
-        continue
+# --- 2) TRASH IMPLEMENTATION ---
+# Cache which mountpoints we've already ensured have a trash dir (speed).
+declare -A ensured_trash_dir=()
+
+had_error=0
+
+get_mountpoint() {
+    # Uses lstat (does NOT follow symlinks), so broken symlinks still work.
+    # Prints mountpoint (e.g. "/", "/home", "/mnt/U1")
+    stat -c %m -- "$1"
+}
+
+ensure_trash_dir() {
+    # $1 = mountpoint
+    local mp="$1"
+    local key="$mp"
+
+    if [[ -n "${ensured_trash_dir[$key]:-}" ]]; then
+        return 0
     fi
 
-    # Get the filename
-    base_name="${file##*/}"
-    
-    # Check for name collision in trash
-    if [ -e "$TRASH_DIR/$base_name" ]; then
-        # Conflict: Add random suffix
-        random_suffix=$(mktemp -u XXXXXXXXXXXX)
-        mv "$file" "$TRASH_DIR/${base_name}-${random_suffix}"
+    local dir
+    if [ "$mp" = "/" ]; then
+        dir="/$TRASH_SUBDIR"
     else
-        # No Conflict: Move cleanly
-        mv "$file" "$TRASH_DIR/"
+        dir="${mp%/}/$TRASH_SUBDIR"
+    fi
+
+    # mkdir -p is cheap; still cache to avoid repeated calls
+    if ! mkdir -p -- "$dir" 2>/dev/null; then
+        return 1
+    fi
+
+    ensured_trash_dir[$key]="$dir"
+    return 0
+}
+
+trash_one() {
+    local file="$1"
+
+    # Determine mountpoint (only on the slow-ish path where we actually do work)
+    local mp
+    if ! mp="$(get_mountpoint "$file" 2>/dev/null)"; then
+        # Probably doesn't exist (or weird permission). Try to produce rm-like error.
+        if [ "$force" = false ]; then
+            echo "rm: cannot remove '$file': No such file or directory" >&2
+        fi
+        return 1
+    fi
+
+    if ! ensure_trash_dir "$mp"; then
+        # Must trash to mountpoint/trash as requested; if we can't create/use it, error.
+        if [ "$force" = false ]; then
+            local dir
+            if [ "$mp" = "/" ]; then dir="/$TRASH_SUBDIR"; else dir="${mp%/}/$TRASH_SUBDIR"; fi
+            echo "rm: cannot move '$file' to '$dir': Permission denied or cannot create trash directory" >&2
+        fi
+        return 1
+    fi
+
+    local trash_dir="${ensured_trash_dir[$mp]}"
+    local base_name
+    base_name="$(basename -- "$file")"
+
+    # Fast path: try move to plain name without overwriting
+    local dest="$trash_dir/$base_name"
+    if mv -n -- "$file" "$dest" 2>/dev/null; then
+        return 0
+    fi
+
+    # On failure, decide what happened:
+    #  - If destination exists -> collision, retry with timestamp suffix
+    #  - If source missing -> rm-like ENOENT
+    #  - Else -> some other error
+    if [ -e "$dest" ] || [ -L "$dest" ]; then
+        # Collision path: timestamp suffix (ns) + pid, plus bounded retries
+        for _ in {1..10}; do
+            local ts
+            ts="$(date +%Y%m%d-%H%M%S-%N)-$$"
+            local dest2="$trash_dir/${base_name}-${ts}"
+            if mv -n -- "$file" "$dest2" 2>/dev/null; then
+                return 0
+            fi
+            # If source disappeared mid-flight, stop early
+            if [ ! -e "$file" ] && [ ! -L "$file" ]; then
+                break
+            fi
+        done
+        if [ "$force" = false ]; then
+            echo "rm: cannot remove '$file': failed to resolve name collision in trash" >&2
+        fi
+        return 1
+    fi
+
+    # Not a collision. Check if source exists (slow path only).
+    if [ ! -e "$file" ] && [ ! -L "$file" ]; then
+        if [ "$force" = false ]; then
+            echo "rm: cannot remove '$file': No such file or directory" >&2
+        fi
+        return 1
+    fi
+
+    # Some other mv failure (permissions, immutable, etc.)
+    if [ "$force" = false ]; then
+        echo "rm: cannot remove '$file': move to trash failed" >&2
+    fi
+    return 1
+}
+
+for f in "${files_to_trash[@]}"; do
+    if ! trash_one "$f"; then
+        had_error=1
+        # rm -f would typically suppress ENOENT; we already do that.
+        # For other errors, -f behaviour varies; we continue either way.
     fi
 done
+
+exit "$had_error"
