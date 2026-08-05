@@ -30,7 +30,8 @@ The `trash` script intercepts `rm` calls and moves files to a local `trash/` dir
 - **Exceptions Bypass**: Bypasses the trash (permanently deletes using `/bin/rm`) for specific applications. `netmgr` is always bypassed. Additional exceptions are read from the `TRASH_EXCEPTIONS` environment variable (e.g., `set -gx TRASH_EXCEPTIONS "paru makepkg yay"`) and fall back to a default list (`paru`, `makepkg`, `yay`, `trigger.sh`) when unset. The script inspects both process names and full command arguments (`/proc/$PID/cmdline`) to match shell-interpreted scripts in the execution chain.
 - **Argument Unpacking**: Pre-processes and expands combined short flags (e.g. `-rf` -> `-r -f`) to ensure standard flags do not trigger accidental fallback to real `/bin/rm`.
 - **Permissions Preservation**: Moves files using `mv` to preserve exact file ownership, permissions, and metadata.
-- **Safety Fallback**: If standard safety flags (`--help` or `--version`) or unknown options are used, it safely passes the call through to the real `/bin/rm`.
+- **Safety Fallback**: Unknown options are passed through to the real `/bin/rm`; `--help` and `--version` are handled by the wrapper itself.
+- **Mountpoint Protection**: Refuses to trash a filesystem mountpoint itself, including under `-f`, before creating any trash run folder.
 
 ---
 
@@ -87,3 +88,4 @@ end
 - **Force Flag**: The `-f` flag suppresses error messages (e.g., if a file doesn't exist) and bypasses clean prompts, mimicking standard `rm` behavior.
 - **Trash Cleanup**: `trash --clean` clears all entries from the current mountpoint's trash directory. It requires path confirmation when run interactively.
 - **App Cleanup**: `trash --clean-app APP` removes grouped trash runs whose folder name starts with `(APP)` or whose recorded `invoked_by` chain has `APP` as an exact process name; use `trash -f --clean-app APP` to skip the interactive prompt.
+- **Mountpoint Targets**: Direct attempts to trash `/`, `/media/...` mount roots, or any other filesystem mountpoint fail with exit status `1` and a clear diagnostic. The mountpoint and its contents are not changed.
