@@ -12,28 +12,35 @@ set -euo pipefail
 #   ts="$(date +%Y%m%d-%H%M%S-%N)-$$"
 #
 # Notes:
-# - Uses mv -n (no clobber) to avoid overwrites.
+# - Uses a private payload directory and verifies every move.
 # - Optimistic move first (fast path), only does extra checks on failure.
 # - Broken symlinks are handled (mv moves the symlink itself).
 
 # --- CONFIG ---
-TRASH_SUBDIR="${TRASH_SUBDIR:-trash}" # name of trash directory at mountpoint (default: "trash")
+TRASH_SUBDIR="${TRASH_SUBDIR:-trash}" # single safe directory name at mountpoint
+TRASH_VERSION="0.2.0"
+
+if [[ ! "$TRASH_SUBDIR" =~ ^[A-Za-z0-9._-]+$ || "$TRASH_SUBDIR" == "." || "$TRASH_SUBDIR" == ".." ]]; then
+    echo "rm: invalid TRASH_SUBDIR '$TRASH_SUBDIR': use one safe directory name" >&2
+    exit 2
+fi
 
 # Always bypass trash for these apps, even when TRASH_EXCEPTIONS is overridden.
 hardcoded_exceptions_array=("netmgr")
 
-# Read space-separated list of exceptions from environment variable
-read -r -a exceptions_array <<<"${TRASH_EXCEPTIONS:-}"
-
-# Fallback: sensible default exceptions if the environment variable is not set
-if [ ${#exceptions_array[@]} -eq 0 ]; then
-    exceptions_array=("paru" "makepkg" "yay" "trigger.sh")
+# Defaults are always retained; the environment variable adds entries.
+exceptions_array=("paru" "makepkg" "yay" "trigger.sh")
+if [ -n "${TRASH_EXCEPTIONS:-}" ]; then
+    read -r -a configured_exceptions_array <<<"$TRASH_EXCEPTIONS"
+    exceptions_array+=("${configured_exceptions_array[@]}")
 fi
-
 exceptions_array+=("${hardcoded_exceptions_array[@]}")
 
 force=false
-use_real_rm=false
+recursive=false
+delete_empty_dirs=false
+interactive_mode=""
+verbose=false
 clean_current_mountpoint=false
 clean_app=""
 show_help=false
@@ -60,21 +67,40 @@ DESCRIPTION
     $prog intercepts rm-style deletes and moves each target into a trash directory
     on the same filesystem mountpoint instead of unlinking it immediately.
 
-    Files deleted in one command are grouped into a single run folder named like:
-    (APP)name1+name2-YYYY-MM-DD_HH-MM-SS-pid-PID
+    Files deleted in one command are grouped into a private random run folder
+    named from the preferred application, shortened target names, timestamp, and
+    PID. The moved entries are stored below that run folder's payload directory.
 
-    Each run folder contains a metadata.json audit record with the original
-    command, working directory, and parent execution chain.
+    Each run folder contains metadata.json and items.jsonl audit records with the
+    original command, working directory, parent execution chain, and move map.
 
 OPTIONS
     -f, --force
-        Suppress missing-file diagnostics and bypass interactive cleanup prompts.
+        Suppress missing-file diagnostics. For cleanup modes, bypass the
+        permanent-deletion confirmation prompt. It does not bypass safety,
+        permission, storage, or move failures.
 
     -r, -R, --recursive
-        Accepted for rm compatibility. Directories are moved as whole trees.
+        Required to move non-empty directories as whole trees.
 
-    -i, -I, -v, --interactive, --verbose
-        Accepted for compatibility and ignored by the trash path.
+    -d, --dir
+        Remove empty directories without recursion.
+
+    -i, --interactive
+        Prompt before moving each target.
+
+    -I
+        Prompt once before recursive or larger operations.
+
+    -v, --verbose
+        Report each successful move.
+
+    --interactive=always|once|never
+        Select per-target, once-per-operation, or no interactive prompting.
+
+    --preserve-root, --preserve-root=all
+        Accepted as no-op compatibility options. Mountpoint and trash-root
+        protections always remain active.
 
     --clean
         Permanently delete all entries in the current mountpoint's trash
@@ -83,8 +109,9 @@ OPTIONS
 
     --clean-app APP
         Permanently delete grouped trash runs on the current mountpoint whose
-        folder name starts with (APP) or whose metadata invoked_by chain
-        contains APP as an exact process name. Requires confirmation in an
+        folder name starts with (APP), or whose metadata invoked_by chain
+        contains APP as an exact process name. The scan checks names first and
+        only reads metadata for non-matching names. Requires confirmation in an
         interactive terminal unless -f is supplied.
 
     --help
@@ -100,7 +127,9 @@ OPERATION
        MOUNTPOINT/TRASH_SUBDIR.
     3. The run folder label prefers codex or agy when either appears in the
        parent execution chain; otherwise it uses the immediate parent process.
-    4. Unknown options and unsupported rm modes fall back to the real /bin/rm.
+    4. Normal trashing uses shared locking; cleanup uses an exclusive lock.
+    5. Unknown and unsupported options fail closed with status 2. The real
+       /bin/rm is used only for exception bypasses and no-operand diagnostics.
 
 EXAMPLES
     $prog file.txt dir
@@ -109,9 +138,20 @@ EXAMPLES
     $prog -f --clean-app agy
 
 FILES
-    metadata.json
-        Written inside each grouped trash run folder with command, cwd, and
-        invoked_by audit data.
+    MOUNTPOINT/TRASH_SUBDIR/<run>/metadata.json
+        JSON audit record with command, cwd, and invoked_by data.
+
+    MOUNTPOINT/TRASH_SUBDIR/<run>/items.jsonl
+        One JSON object per moved source and destination pair.
+
+    MOUNTPOINT/TRASH_SUBDIR/<run>/payload/
+        Private directory containing the moved files and folders.
+
+    MOUNTPOINT/TRASH_SUBDIR/.trash.lock
+        Lock used to coordinate trashing and cleanup.
+
+    MOUNTPOINT/TRASH_SUBDIR/.trash-root
+        Marker required for custom TRASH_SUBDIR roots.
 
 PATHS
     /trash
@@ -126,9 +166,13 @@ PATHS
 
 SECURITY NOTES
     Cleanup modes use permanent deletion via /bin/rm.
-    Unknown options also fall through to /bin/rm for correctness.
+    Unsupported options never fall through to permanent /bin/rm.
     Filesystem mountpoints are refused as trash targets before any trash folder
     is created, including when -f or --force is supplied.
+    Trash roots must be real, same-filesystem directories without group/other
+    write access. Root operations require root-owned roots and markers.
+    Cleanup is limited to direct entries below the trusted trash directory and
+    does not cross nested filesystems.
     If TRASH_EXCEPTIONS is set, its entries are added to the configurable
     bypass list; netmgr is always hardcoded to bypass trash.
 
@@ -145,7 +189,83 @@ EOF
 print_version() {
     local prog
     prog="$(basename -- "$0")"
-    printf '%s %s\n' "$prog" "0.1.0"
+    printf '%s %s\n' "$prog" "$TRASH_VERSION"
+}
+
+is_exception_name() {
+    local candidate="$1"
+    local exception
+    for exception in "${exceptions_array[@]}"; do
+        if [ "$candidate" = "$exception" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+is_shell_interpreter() {
+    case "$1" in
+        bash | sh | dash | zsh | ksh | fish) return 0 ;;
+    esac
+    return 1
+}
+
+# Return the script operand for a shell command, not arbitrary -c source or
+# unrelated user arguments.  This prevents exception words in prompts and
+# command data from activating permanent deletion.
+script_name_from_cmdline() {
+    local cmd0="$1"
+    local token
+    local after_options=false
+    shift
+    is_shell_interpreter "$cmd0" || return 1
+    for token; do
+        if [ "$after_options" = false ]; then
+            case "$token" in
+                -c | -O | -o) return 1 ;;
+                --)
+                    after_options=true
+                    continue
+                    ;;
+                -*) continue ;;
+            esac
+        fi
+        printf '%s\n' "${token##*/}"
+        return 0
+    done
+    return 1
+}
+
+preferred_app_from_cmdline() {
+    local cmd0="$1"
+    local script_name
+    case "$cmd0" in
+        codex | agy)
+            printf '%s\n' "$cmd0"
+            return 0
+            ;;
+    esac
+    if script_name="$(script_name_from_cmdline "$@" 2>/dev/null)"; then
+        case "$script_name" in
+            codex | agy)
+                printf '%s\n' "$script_name"
+                return 0
+                ;;
+        esac
+    fi
+    return 1
+}
+
+exception_from_cmdline() {
+    local cmd0="$1"
+    local script_name
+    if is_exception_name "$cmd0"; then
+        return 0
+    fi
+    if script_name="$(script_name_from_cmdline "$@" 2>/dev/null)" && is_exception_name "$script_name"; then
+        return 0
+    fi
+    return 1
 }
 
 # --- 1) UNPACK COMBINED SHORT OPTIONS ---
@@ -166,65 +286,53 @@ set -- "${unpacked_args[@]}"
 process_chain=()
 preferred_parent_app=""
 curr_pid="$PPID"
-while [ "$curr_pid" -gt 1 ]; do
-    if [ -f "/proc/$curr_pid/comm" ]; then
-        name=$(<"/proc/$curr_pid/comm")
+while [[ "$curr_pid" =~ ^[0-9]+$ ]] && [ "$curr_pid" -gt 1 ]; do
+    name=""
+    if [ -r "/proc/$curr_pid/comm" ]; then
+        name=$(<"/proc/$curr_pid/comm") || name=""
         name="${name//$'\n'/}"
-        process_chain+=("$name")
-        if [ -z "$preferred_parent_app" ]; then
-            case "$name" in
-                codex | agy)
-                    preferred_parent_app="$name"
-                    ;;
-            esac
-        fi
-    else
-        break
-    fi
-
-    # Read the full command line to check for script arguments (e.g. bash trigger.sh)
-    if [ -f "/proc/$curr_pid/cmdline" ]; then
-        cmdline=$(tr '\0' ' ' <"/proc/$curr_pid/cmdline" 2>/dev/null || true)
-        if [ -z "$preferred_parent_app" ]; then
-            for app in codex agy; do
-                if [[ "$cmdline" =~ (^|[[:space:]]|/)"$app"([[:space:]]|$) ]]; then
-                    preferred_parent_app="$app"
-                    break
-                fi
-            done
-        fi
-        # If the cmdline matches any exception as a filename/word, bypass immediately
-        for exc in "${exceptions_array[@]}"; do
-            if [[ "$cmdline" =~ (^|[[:space:]]|/)"$exc"([[:space:]]|$) ]]; then
+        if [ -n "$name" ]; then
+            process_chain+=("$name")
+            if [ -z "$preferred_parent_app" ]; then
+                case "$name" in
+                    codex | agy) preferred_parent_app="$name" ;;
+                esac
+            fi
+            if is_exception_name "$name"; then
                 exec /bin/rm "${orig_argv[@]}"
             fi
-        done
+        fi
+    fi
+
+    cmdline_args=()
+    if [ -r "/proc/$curr_pid/cmdline" ]; then
+        mapfile -d '' -t cmdline_args <"/proc/$curr_pid/cmdline" 2>/dev/null || cmdline_args=()
+    fi
+    if [ ${#cmdline_args[@]} -gt 0 ]; then
+        cmd0="${cmdline_args[0]##*/}"
+        if [ -z "$preferred_parent_app" ] && preferred="$(preferred_app_from_cmdline "${cmdline_args[@]}" 2>/dev/null)"; then
+            preferred_parent_app="$preferred"
+        fi
+        if exception_from_cmdline "${cmdline_args[@]}"; then
+            exec /bin/rm "${orig_argv[@]}"
+        fi
     fi
 
     next_pid=""
-    if [ -f "/proc/$curr_pid/status" ]; then
+    if [ -r "/proc/$curr_pid/status" ]; then
         while IFS=$'\t ' read -r key value; do
             if [ "$key" = "PPid:" ]; then
                 next_pid="$value"
                 break
             fi
-        done <"/proc/$curr_pid/status"
+        done <"/proc/$curr_pid/status" || true
     fi
 
-    if [ -n "$next_pid" ] && [ "$next_pid" -ne "$curr_pid" ]; then
+    if [[ "$next_pid" =~ ^[0-9]+$ ]] && [ "$next_pid" -ne "$curr_pid" ]; then
         curr_pid="$next_pid"
     else
         break
     fi
-done
-
-# If any application name itself in the execution chain is on the exceptions list, bypass trash
-for proc in "${process_chain[@]}"; do
-    for exc in "${exceptions_array[@]}"; do
-        if [ "$proc" = "$exc" ]; then
-            exec /bin/rm "${orig_argv[@]}"
-        fi
-    done
 done
 
 # --- 3) PARSE ARGUMENTS (robust) ---
@@ -242,12 +350,55 @@ while [ $# -gt 0 ]; do
             force=true
             shift
             ;;
+        -r | -R | --recursive)
+            recursive=true
+            shift
+            ;;
+        -d | --dir)
+            delete_empty_dirs=true
+            shift
+            ;;
+        -i | --interactive)
+            interactive_mode="always"
+            shift
+            ;;
+        -I)
+            interactive_mode="once"
+            shift
+            ;;
+        -v | --verbose)
+            verbose=true
+            shift
+            ;;
+        --interactive=always)
+            interactive_mode="always"
+            shift
+            ;;
+        --interactive=once)
+            interactive_mode="once"
+            shift
+            ;;
+        --interactive=never)
+            interactive_mode=""
+            shift
+            ;;
+        --preserve-root | --preserve-root=all)
+            shift
+            ;;
+        --no-preserve-root)
+            echo "rm: refusing unsupported --no-preserve-root because trash safety cannot be bypassed" >&2
+            exit 2
+            ;;
+        --one-file-system)
+            echo "rm: unsupported --one-file-system cannot be safely emulated by trash" >&2
+            exit 2
+            ;;
         --clean)
             clean_current_mountpoint=true
             shift
             ;;
         --clean-app)
-            if [ $# -lt 2 ] || [ -z "$2" ]; then
+            if [ $# -lt 2 ] || [ -z "$2" ] || [[ "$2" == -* ]]; then
                 echo "rm: option '--clean-app' requires an app name" >&2
                 exit 2
             fi
@@ -262,10 +413,6 @@ while [ $# -gt 0 ]; do
             fi
             shift
             ;;
-        -i | -v | -I | --interactive | --verbose | -r | -R | --recursive)
-            # accepted but ignored; behaviour is "trash", not full rm emulation
-            shift
-            ;;
         --)
             shift
             # everything after -- is a path
@@ -275,9 +422,8 @@ while [ $# -gt 0 ]; do
             done
             ;;
         -*)
-            # unknown option => fall back to real rm for correctness
-            use_real_rm=true
-            break
+            echo "rm: unsupported option '$1'; refusing permanent /bin/rm fallback" >&2
+            exit 2
             ;;
         *)
             files_to_trash+=("$1")
@@ -301,6 +447,11 @@ if [ -n "$clean_app" ] && [ ${#files_to_trash[@]} -gt 0 ]; then
     exit 2
 fi
 
+if [ -n "$clean_app" ] && [[ ! "$clean_app" =~ ^[A-Za-z0-9._-]+$ ]]; then
+    echo "rm: invalid application name '$clean_app'" >&2
+    exit 2
+fi
+
 if [ "$show_help" = true ]; then
     print_help
     exit 0
@@ -311,8 +462,9 @@ if [ "$show_version" = true ]; then
     exit 0
 fi
 
-# If passing through, do it with the original arguments
-if [ "$use_real_rm" = true ] || { [ "$clean_current_mountpoint" = false ] && [ -z "$clean_app" ] && [ ${#files_to_trash[@]} -eq 0 ]; }; then
+# Preserve normal rm's no-operand diagnostics and -f behavior.  This is the
+# only non-exception path that invokes /bin/rm.
+if [ "$clean_current_mountpoint" = false ] && [ -z "$clean_app" ] && [ ${#files_to_trash[@]} -eq 0 ]; then
     exec /bin/rm "${orig_argv[@]}"
 fi
 
@@ -322,17 +474,26 @@ parent_app="unknown"
 if [ ${#process_chain[@]} -gt 0 ]; then
     parent_app="${preferred_parent_app:-${process_chain[0]}}"
     parent_app="${parent_app//[^a-zA-Z0-9._-]/_}"
+    parent_app="${parent_app:0:32}"
 fi
 
 # Generate a unique, timestamped folder name using prefixes of the first few
 # targets and a sanitized parent app tag at the front.
+short_name() {
+    local path="$1"
+    local value
+    while [[ "$path" == */ ]]; do
+        path="${path%/}"
+    done
+    value="${path##*/}"
+    value="${value//[^a-zA-Z0-9._-]/_}"
+    [ -n "$value" ] || value="item"
+    printf '%s' "${value:0:48}"
+}
+
 names=()
 for item in "${files_to_trash[@]:0:2}"; do
-    # Get basename and replace special/unsafe characters with underscores
-    clean_name="$(basename -- "$item" | sed 's/[^a-zA-Z0-9._-]/_/g')"
-    if [ -n "$clean_name" ]; then
-        names+=("$clean_name")
-    fi
+    names+=("$(short_name "$item")")
 done
 
 prefix=""
@@ -340,7 +501,7 @@ if [ ${#names[@]} -gt 0 ]; then
     # Join the names with plus signs and add a trailing dash
     prefix="$(
         IFS=+
-        echo "${names[*]}"
+        printf '%s' "${names[*]}"
     )-"
 fi
 
@@ -348,13 +509,35 @@ RUN_DIR_NAME="(${parent_app})${prefix}$(date +%Y-%m-%d_%H-%M-%S)-pid-$$"
 
 # --- PRE-COMPUTE METADATA JSON CONTENT ---
 escape_json_string() {
+    local LC_ALL=C
     local str="$1"
-    str="${str//\\/\\\\}"
-    str="${str//\"/\\\"}"
-    str="${str//$'\n'/\\n}"
-    str="${str//$'\r'/\\r}"
-    str="${str//$'\t'/\\t}"
-    echo -n "$str"
+    local result=""
+    local index code char escaped
+
+    # Most paths and process names are printable ASCII. Keep that common case
+    # in Bash's bulk substitution path instead of looping over every byte.
+    if [[ "$str" =~ ^[[:print:]]*$ ]]; then
+        str="${str//\\/\\\\}"
+        str="${str//\"/\\\"}"
+        printf '%s' "$str"
+        return 0
+    fi
+
+    for ((index = 0; index < ${#str}; index++)); do
+        char="${str:index:1}"
+        printf -v code '%d' "'$char"
+        if ((code < 0x20 || code > 0x7e)); then
+            printf -v escaped '\\u%04x' "$code"
+            result+="$escaped"
+        else
+            case "$char" in
+                \\) result+="\\\\" ;;
+                \") result+="\\\\\"" ;;
+                *) result+="$char" ;;
+            esac
+        fi
+    done
+    printf '%s' "$result"
 }
 
 cmd_name="rm"
@@ -375,18 +558,21 @@ if [ ${#process_chain[@]} -gt 0 ]; then
 fi
 
 METADATA_JSON_CONTENT="$(
-    cat <<EOF
-{
-  "command": "$(escape_json_string "$cmd_string")",
-  "cwd": "$(escape_json_string "$PWD")",
-  "invoked_by": "$(escape_json_string "$invoked_by")"
-}
-EOF
+    printf '{\n'
+    printf '  "command": "%s",\n' "$(escape_json_string "$cmd_string")"
+    printf '  "cwd": "%s",\n' "$(escape_json_string "$PWD")"
+    printf '  "invoked_by": "%s"\n' "$(escape_json_string "$invoked_by")"
+    printf '}\n'
 )"
 
 # --- 5) TRASH IMPLEMENTATION ---
 # Cache which mountpoints we've already ensured have a trash dir (speed).
 declare -A ensured_trash_dir=()
+declare -A ensured_run_dir=()
+declare -A trash_lock_fds=()
+declare -A trash_manifest_fds=()
+declare -A canonical_mountpoints=()
+declare -A canonical_trash_roots=()
 
 had_error=0
 
@@ -399,143 +585,388 @@ get_mountpoint() {
 is_mountpoint_target() {
     local file="$1"
     local mp="$2"
-    local file_real
+    local file_real="${3:-}"
     local mp_real
 
     [ -L "$file" ] && return 1
-    file_real="$(realpath -e -- "$file" 2>/dev/null)" || return 1
-    mp_real="$(realpath -e -- "$mp" 2>/dev/null)" || return 1
+    [ -n "$file_real" ] || return 1
+    if [ -z "${canonical_mountpoints[$mp]:-}" ]; then
+        canonical_mountpoints[$mp]="$(realpath -e -- "$mp" 2>/dev/null)" || return 1
+    fi
+    mp_real="${canonical_mountpoints[$mp]}"
     [ "$file_real" = "$mp_real" ]
 }
 
-trash_dir_for_mountpoint() {
-    # $1 = mountpoint
+is_inside_trash_root() {
+    local file="$1"
+    local mp="$2"
+    local file_real="${3:-}"
+    local root root_real
+
+    [ -L "$file" ] && return 1
+    [ -n "$file_real" ] || return 1
+    root="$(trash_dir_for_mountpoint "$mp")"
+    if [ -z "${canonical_trash_roots[$mp]:-}" ]; then
+        canonical_trash_roots[$mp]="$(realpath -m -- "$root" 2>/dev/null)" || return 1
+    fi
+    root_real="${canonical_trash_roots[$mp]}"
+    case "$file_real" in
+        "$root_real" | "$root_real"/*) return 0 ;;
+    esac
+    return 1
+}
+
+trash_root_for_mountpoint() {
     local mp="$1"
     if [ "$mp" = "/" ]; then
-        echo "/$TRASH_SUBDIR"
+        printf '/%s\n' "$TRASH_SUBDIR"
     else
-        echo "${mp%/}/$TRASH_SUBDIR"
+        printf '%s/%s\n' "${mp%/}" "$TRASH_SUBDIR"
+    fi
+}
+
+trash_dir_for_mountpoint() {
+    trash_root_for_mountpoint "$1"
+}
+
+check_trash_root() {
+    local mp="$1"
+    local root="$2"
+    local owner mode device mp_device marker numeric_mode
+
+    if [ -L "$root" ] || [ ! -d "$root" ]; then
+        echo "rm: refusing untrusted trash root '$root': it must be a real directory" >&2
+        return 1
+    fi
+    if ! read -r owner mode device < <(stat -c '%u %a %d' -- "$root"); then
+        echo "rm: cannot inspect trash root '$root'" >&2
+        return 1
+    fi
+    mp_device="$(stat -c '%d' -- "$mp")" || {
+        echo "rm: cannot inspect mountpoint '$mp'" >&2
+        return 1
+    }
+    if [ "$device" != "$mp_device" ]; then
+        echo "rm: refusing trash root '$root': it is on a different filesystem" >&2
+        return 1
+    fi
+    numeric_mode=$((8#$mode))
+    if ((numeric_mode & 0022)); then
+        echo "rm: refusing trash root '$root': group/other write permission is unsafe" >&2
+        return 1
+    fi
+    if [ "$EUID" -eq 0 ] && [ "$owner" -ne 0 ]; then
+        echo "rm: refusing root operation: trash root '$root' is not root-owned" >&2
+        return 1
+    fi
+    if [ "$EUID" -ne 0 ] && [ "$owner" -ne 0 ] && [ "$owner" -ne "$EUID" ]; then
+        echo "rm: refusing trash root '$root': it is owned by another user" >&2
+        return 1
+    fi
+    if [ "$TRASH_SUBDIR" != "trash" ]; then
+        marker="$root/.trash-root"
+        if [ -L "$marker" ] || [ ! -f "$marker" ]; then
+            echo "rm: refusing custom trash root '$root': missing .trash-root marker" >&2
+            return 1
+        fi
+        read -r owner mode < <(stat -c '%u %a' -- "$marker") || return 1
+        if [ "$EUID" -eq 0 ] && [ "$owner" -ne 0 ]; then
+            echo "rm: refusing root operation: trash marker '$marker' is not root-owned" >&2
+            return 1
+        fi
+        numeric_mode=$((8#$mode))
+        if ((numeric_mode & 0077)); then
+            echo "rm: refusing trash marker '$marker': it must be private" >&2
+            return 1
+        fi
+    fi
+}
+
+ensure_trash_root() {
+    local mp="$1"
+    local root created=false
+    root="$(trash_root_for_mountpoint "$mp")"
+    if [ ! -e "$root" ]; then
+        if ! mkdir -m 0755 -- "$root" 2>/dev/null; then
+            echo "rm: cannot create trash root '$root'" >&2
+            return 1
+        fi
+        created=true
+    fi
+    if [ "$created" = true ] && [ "$TRASH_SUBDIR" != "trash" ]; then
+        if ! : >"$root/.trash-root"; then
+            echo "rm: cannot create trash marker '$root/.trash-root'" >&2
+            return 1
+        fi
+        chmod 600 -- "$root/.trash-root" 2>/dev/null || true
+    fi
+    if ! check_trash_root "$mp" "$root"; then
+        return 1
+    fi
+}
+
+validate_trash_dir() {
+    local mp="$1"
+    local dir owner mode numeric_mode
+    dir="$(trash_dir_for_mountpoint "$mp")"
+    if [ ! -e "$dir" ]; then
+        if ! mkdir -m 0700 -- "$dir" 2>/dev/null; then
+            echo "rm: cannot create trash directory '$dir'" >&2
+            return 1
+        fi
+    fi
+    if [ -L "$dir" ] || [ ! -d "$dir" ]; then
+        echo "rm: refusing trash directory '$dir': it must be a real directory" >&2
+        return 1
+    fi
+    if ! read -r owner mode < <(stat -c '%u %a' -- "$dir"); then
+        echo "rm: cannot inspect trash directory '$dir'" >&2
+        return 1
+    fi
+    if [ "$owner" -ne "$EUID" ]; then
+        echo "rm: refusing trash directory '$dir': it is not owned by the current user" >&2
+        return 1
+    fi
+    numeric_mode=$((8#$mode))
+    if ((numeric_mode & 0022)); then
+        echo "rm: refusing trash directory '$dir': group/other write permission is unsafe" >&2
+        return 1
+    fi
+    if [ "$(stat -c '%d' -- "$dir")" != "$(stat -c '%d' -- "$mp")" ]; then
+        echo "rm: refusing trash directory '$dir': it is on a different filesystem" >&2
+        return 1
     fi
 }
 
 ensure_trash_dir() {
-    # $1 = mountpoint
     local mp="$1"
     local key="$mp"
+    local dir run_dir payload_dir metadata_tmp manifest_fd
 
     if [[ -n "${ensured_trash_dir[$key]:-}" ]]; then
         return 0
     fi
 
-    local dir
+    if ! ensure_trash_root "$mp"; then
+        return 1
+    fi
     dir="$(trash_dir_for_mountpoint "$mp")"
-
-    # Create the run-specific subdirectory (master folder)
-    if ! mkdir -p -- "$dir/$RUN_DIR_NAME" 2>/dev/null; then
+    if ! validate_trash_dir "$mp"; then
         return 1
     fi
 
-    # Write metadata atomically so a failed/interrupted write does not leave an empty audit file.
-    local metadata_tmp
-    metadata_tmp="$dir/$RUN_DIR_NAME/metadata.json.tmp.$$"
-    if ! printf '%s\n' "$METADATA_JSON_CONTENT" >"$metadata_tmp" 2>/dev/null || ! mv -f -- "$metadata_tmp" "$dir/$RUN_DIR_NAME/metadata.json" 2>/dev/null; then
-        /bin/rm -f -- "$metadata_tmp" 2>/dev/null || true
+    if ! acquire_trash_lock "$mp"; then
         return 1
     fi
 
-    ensured_trash_dir[$key]="$dir/$RUN_DIR_NAME"
-    return 0
+    if ! run_dir="$(mktemp -d -- "$dir/${RUN_DIR_NAME}.XXXXXX" 2>/dev/null)"; then
+        echo "rm: cannot create a unique trash run directory in '$dir'" >&2
+        return 1
+    fi
+    if ! mkdir -m 0700 -- "$run_dir/payload" 2>/dev/null; then
+        /bin/rm -rf -- "$run_dir"
+        echo "rm: cannot create trash payload directory '$run_dir/payload'" >&2
+        return 1
+    fi
+    if ! metadata_tmp="$(mktemp -- "$run_dir/.metadata.json.tmp.XXXXXX" 2>/dev/null)"; then
+        /bin/rm -rf -- "$run_dir"
+        echo "rm: cannot create metadata temporary file in '$run_dir'" >&2
+        return 1
+    fi
+    if ! printf '%s' "$METADATA_JSON_CONTENT" >"$metadata_tmp" || ! mv -f -- "$metadata_tmp" "$run_dir/metadata.json"; then
+        /bin/rm -f -- "$metadata_tmp"
+        /bin/rm -rf -- "$run_dir"
+        echo "rm: cannot write metadata in '$run_dir'" >&2
+        return 1
+    fi
+    if ! : >"$run_dir/items.jsonl"; then
+        /bin/rm -rf -- "$run_dir"
+        echo "rm: cannot create item manifest in '$run_dir'" >&2
+        return 1
+    fi
+    if ! exec {manifest_fd}>>"$run_dir/items.jsonl"; then
+        /bin/rm -rf -- "$run_dir"
+        echo "rm: cannot open item manifest in '$run_dir'" >&2
+        return 1
+    fi
+
+    payload_dir="$run_dir/payload"
+    ensured_run_dir[$key]="$run_dir"
+    ensured_trash_dir[$key]="$payload_dir"
+    trash_manifest_fds[$key]="$manifest_fd"
+}
+
+acquire_trash_lock() {
+    local mp="$1"
+    local lock_mode="${2:-shared}"
+    local dir fd
+    if [[ -n "${trash_lock_fds[$mp]:-}" ]]; then
+        return 0
+    fi
+    dir="$(trash_dir_for_mountpoint "$mp")"
+    if [ -L "$dir/.trash.lock" ]; then
+        echo "rm: refusing trash lock '$dir/.trash.lock': it is a symlink" >&2
+        return 1
+    fi
+    if ! exec {fd}>>"$dir/.trash.lock"; then
+        echo "rm: cannot open trash lock '$dir/.trash.lock'" >&2
+        return 1
+    fi
+    if [ "$lock_mode" = "exclusive" ]; then
+        if ! flock -x "$fd"; then
+            exec {fd}>&-
+            echo "rm: cannot acquire exclusive trash lock '$dir/.trash.lock'" >&2
+            return 1
+        fi
+    elif ! flock -s "$fd"; then
+        exec {fd}>&-
+        echo "rm: cannot acquire trash lock '$dir/.trash.lock'" >&2
+        return 1
+    fi
+    trash_lock_fds[$mp]="$fd"
+}
+
+confirm_cleanup_prompt() {
+    local prompt="$1"
+    local expected="$2"
+    local response
+
+    if [ "$force" = true ]; then
+        return 0
+    fi
+    if [ ! -t 0 ] || [ ! -t 2 ]; then
+        echo "rm: refusing permanent cleanup without a terminal; use --force explicitly" >&2
+        return 1
+    fi
+    printf '%s' "$prompt" >&2
+    if ! IFS= read -r response; then
+        echo "rm: failed to read cleanup confirmation" >&2
+        return 1
+    fi
+    if [ "$response" != "$expected" ]; then
+        echo "rm: cleanup confirmation failed" >&2
+        return 1
+    fi
 }
 
 clean_current_trash() {
-    local mp
+    local mp root dir trash_device
     if ! mp="$(get_mountpoint "." 2>/dev/null)"; then
-        if [ "$force" = false ]; then
-            echo "rm: cannot clean trash: failed to determine mountpoint for '$PWD'" >&2
-        fi
+        echo "rm: cannot clean trash: failed to determine mountpoint for '$PWD'" >&2
         return 1
     fi
-
-    local dir
+    root="$(trash_root_for_mountpoint "$mp")"
+    if [ ! -e "$root" ]; then
+        return 0
+    fi
+    if ! check_trash_root "$mp" "$root"; then
+        return 1
+    fi
     dir="$(trash_dir_for_mountpoint "$mp")"
     if [ ! -d "$dir" ]; then
         return 0
     fi
-
-    # Require confirmation if stdout/stdin is a terminal and --force is not specified
-    if [ "$force" = false ] && [ -t 0 ] && [ -t 1 ]; then
-        echo "WARNING: This will permanently empty the trash at '$dir'." >&2
-        echo -n "To confirm, please type the full path of the trash directory: " >&2
-        local response
-        if ! read -r response; then
-            echo -e "\nError: Failed to read confirmation. Aborting." >&2
-            return 1
-        fi
-        if [ "$response" != "$dir" ]; then
-            echo "Confirmation failed (input did not match '$dir'). Aborting." >&2
-            return 1
-        fi
-    fi
-
-    # find -delete handles hidden entries and does not require shell globs.
-    if ! find "$dir" -mindepth 1 -delete 2>/dev/null; then
-        if [ "$force" = false ]; then
-            echo "rm: cannot clean trash at '$dir': Permission denied or deletion failed" >&2
-        fi
+    if ! validate_trash_dir "$mp"; then
         return 1
     fi
+    if ! acquire_trash_lock "$mp" exclusive; then
+        return 1
+    fi
+    if ! confirm_cleanup_prompt "WARNING: type '$dir' to permanently empty it: " "$dir"; then
+        return 1
+    fi
+    if ! trash_device="$(stat -c '%d' -- "$dir")"; then
+        echo "rm: cannot inspect trash device '$dir'" >&2
+        return 1
+    fi
+    if ! find "$dir" -xdev -mindepth 1 -maxdepth 1 \
+        ! -path "$dir/.trash.lock" ! -path "$dir/.trash-root" \
+        -printf '%D\0%p\0' |
+        bash -c '
+            trash_device="$1"
+            shift
+            status=0
+            entries=()
 
-    return 0
+            delete_batch() {
+                if [ "${#entries[@]}" -eq 0 ]; then
+                    return 0
+                fi
+                if ! /bin/rm --one-file-system -rf -- "${entries[@]}"; then
+                    status=1
+                fi
+                entries=()
+            }
+
+            while IFS= read -r -d "" entry_device && IFS= read -r -d "" entry; do
+                if [ "$entry_device" = "$trash_device" ]; then
+                    entries+=("$entry")
+                    if [ "${#entries[@]}" -ge 256 ]; then
+                        delete_batch
+                    fi
+                else
+                    status=1
+                fi
+            done
+            delete_batch
+            exit "$status"
+        ' bash "$trash_device"; then
+        echo "rm: cannot clean trash at '$dir': deletion failed" >&2
+        return 1
+    fi
 }
 
 clean_trash_by_app() {
     local app="$1"
-    local mp
+    local mp root dir matches_file metadata_paths match_count scan_failed
     if ! mp="$(get_mountpoint "." 2>/dev/null)"; then
-        if [ "$force" = false ]; then
-            echo "rm: cannot clean trash: failed to determine mountpoint for '$PWD'" >&2
-        fi
+        echo "rm: cannot clean trash: failed to determine mountpoint for '$PWD'" >&2
         return 1
     fi
 
-    local dir
+    root="$(trash_root_for_mountpoint "$mp")"
+    if [ ! -e "$root" ]; then
+        return 0
+    fi
+    if ! check_trash_root "$mp" "$root"; then
+        return 1
+    fi
     dir="$(trash_dir_for_mountpoint "$mp")"
     if [ ! -d "$dir" ]; then
         return 0
     fi
-
-    local matches_file
-    if ! matches_file="$(mktemp)"; then
-        if [ "$force" = false ]; then
-            echo "rm: cannot clean trash entries for app '$app': failed to create temp file" >&2
-        fi
+    if ! validate_trash_dir "$mp" || ! acquire_trash_lock "$mp" exclusive; then
         return 1
     fi
 
-    find "$dir" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null | awk -v app="$app" '
-        BEGIN { RS = "\0"; ORS = "" }
-        {
-            base = $0
-            sub(/^.*\//, "", base)
-            if (substr(base, 1, length(app) + 2) == "(" app ")") {
-                printf "%s%c", $0, 0
-            }
-        }
-    ' >"$matches_file" 2>/dev/null || true
+    if ! matches_file="$(mktemp)" || ! metadata_paths="$(mktemp)"; then
+        echo "rm: cannot clean trash entries for app '$app': failed to create temporary files" >&2
+        return 1
+    fi
+    scan_failed=false
 
-    # shellcheck disable=SC2016 # $0 belongs to awk, not the shell.
-    find "$dir" -mindepth 1 -maxdepth 1 -type d -exec sh -c '
+    if ! find "$dir" -xdev -mindepth 1 -maxdepth 1 -type d -exec sh -c '
+        app="$1"
+        shift
         for run_dir do
             base="${run_dir##*/}"
             case "$base" in
-                "($1)"*) continue ;;
+                "($app)"*)
+                    printf "%s\0" "$run_dir" >&3
+                    continue
+                    ;;
             esac
             metadata="$run_dir/metadata.json"
             if [ -f "$metadata" ]; then
-                printf "%s\0" "$metadata"
+                printf "%s\0" "$metadata" >&4
             fi
         done
-    ' sh "$app" {} + 2>/dev/null | xargs -0 -r awk -v app="$app" '
+    ' sh "$app" {} + 3>"$matches_file" 4>"$metadata_paths"; then
+        scan_failed=true
+    fi
+
+    # shellcheck disable=SC2016 # $0 belongs to awk, not the shell.
+    if [ "$scan_failed" = false ] && ! xargs -0 -r awk -v app="$app" '
         /^[[:space:]]*"invoked_by"[[:space:]]*:/ {
             line = $0
             sub(/^[^:]*:[[:space:]]*"/, "", line)
@@ -543,43 +974,48 @@ clean_trash_by_app() {
             count = split(line, chain, /[[:space:]]*<-[[:space:]]*/)
             for (i = 1; i <= count; i++) {
                 if (chain[i] == app) {
-                    sub(/\/metadata\.json$/, "", FILENAME)
-                    printf "%s%c", FILENAME, 0
+                    run = FILENAME
+                    sub(/\/metadata\.json$/, "", run)
+                    printf "%s%c", run, 0
                     nextfile
                 }
             }
         }
-    ' >>"$matches_file" 2>/dev/null || true
-
-    local match_count
-    match_count="$(tr -cd '\0' <"$matches_file" | wc -c)"
-
-    if [ "$match_count" -eq 0 ]; then
-        /bin/rm -f -- "$matches_file"
-        return 0
+    ' <"$metadata_paths" >>"$matches_file"; then
+        scan_failed=true
     fi
 
-    if [ "$force" = false ] && [ -t 0 ] && [ -t 1 ]; then
-        echo "WARNING: This will permanently delete $match_count trash run(s) from '$dir' whose execution chain includes app '$app'." >&2
-        echo -n "To confirm, please type the app name '$app': " >&2
-        local response
-        if ! read -r response; then
-            echo -e "\nError: Failed to read confirmation. Aborting." >&2
+    /bin/rm -f -- "$metadata_paths"
+    if [ "$scan_failed" = true ]; then
+        /bin/rm -f -- "$matches_file"
+        echo "rm: cannot clean trash entries for app '$app': scan failed" >&2
+        return 1
+    fi
+
+    if [ "$force" = true ]; then
+        if [ ! -s "$matches_file" ]; then
+            /bin/rm -f -- "$matches_file"
+            return 0
+        fi
+    else
+        if ! match_count="$(tr -cd '\0' <"$matches_file" | wc -c)"; then
+            /bin/rm -f -- "$matches_file"
+            echo "rm: cannot count trash entries for app '$app'" >&2
+            return 1
+        fi
+        if [ "$match_count" -eq 0 ]; then
+            /bin/rm -f -- "$matches_file"
+            return 0
+        fi
+        if ! confirm_cleanup_prompt "WARNING: type '$app' to permanently delete $match_count trash run(s): " "$app"; then
             /bin/rm -f -- "$matches_file"
             return 1
         fi
-        if [ "$response" != "$app" ]; then
-            echo "Confirmation failed (input did not match '$app'). Aborting." >&2
-            /bin/rm -f -- "$matches_file"
-            return 1
-        fi
     fi
 
-    if ! xargs -0 -r /bin/rm -rf -- <"$matches_file"; then
+    if ! xargs -0 -r /bin/rm --one-file-system -rf -- <"$matches_file"; then
         /bin/rm -f -- "$matches_file"
-        if [ "$force" = false ]; then
-            echo "rm: cannot clean trash entries for app '$app': deletion failed" >&2
-        fi
+        echo "rm: cannot clean trash entries for app '$app': deletion failed" >&2
         return 1
     fi
 
@@ -587,10 +1023,65 @@ clean_trash_by_app() {
     return 0
 }
 
+prompt_for_target() {
+    local file="$1"
+    local response
+    printf "rm: move '%s' to trash? [y/N] " "$file" >&2
+    if ! IFS= read -r response; then
+        echo "rm: failed to read interactive confirmation" >&2
+        return 2
+    fi
+    case "$response" in
+        y | Y | yes | YES | Yes) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+confirm_once_prompt() {
+    local response
+    printf "rm: move these targets to trash? [y/N] " >&2
+    if ! IFS= read -r response; then
+        echo "rm: failed to read interactive confirmation" >&2
+        return 1
+    fi
+    case "$response" in
+        y | Y | yes | YES | Yes) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+source_basename() {
+    local path="$1"
+    while [[ "$path" == */ ]]; do
+        path="${path%/}"
+    done
+    printf '%s' "${path##*/}"
+}
+
+record_manifest_item() {
+    local mp="$1"
+    local source="$2"
+    local destination="$3"
+    local run_dir="${ensured_run_dir[$mp]}"
+    local manifest_fd="${trash_manifest_fds[$mp]:-}"
+    if [ -z "$manifest_fd" ]; then
+        echo "rm: warning: item manifest is not open for '$run_dir'" >&2
+        return 1
+    fi
+    if ! printf '{"source":"%s","destination":"%s"}\n' \
+        "$(escape_json_string "$source")" \
+        "$(escape_json_string "$destination")" >&"$manifest_fd"; then
+        echo "rm: warning: moved '$source' but could not update '$run_dir/items.jsonl'" >&2
+        return 1
+    fi
+}
+
 trash_one() {
     local file="$1"
+    local mp root trash_dir base_name dest dest2 ts file_real
+    local move_succeeded=false
+    local attempt
 
-    # rm -f treats a missing operand as success.
     if [ ! -e "$file" ] && [ ! -L "$file" ]; then
         if [ "$force" = false ]; then
             echo "rm: cannot remove '$file': No such file or directory" >&2
@@ -598,81 +1089,123 @@ trash_one() {
         fi
         return 0
     fi
+    base_name="$(source_basename "$file")"
+    case "$base_name" in
+        . | ..)
+            echo "rm: refusing to remove '$file'" >&2
+            return 1
+            ;;
+    esac
+    case "$file" in
+        . | .. | */. | */..)
+            echo "rm: refusing to remove '$file'" >&2
+            return 1
+            ;;
+    esac
 
-    # Determine mountpoint (only on the slow-ish path where we actually do work)
-    local mp
-    if ! mp="$(get_mountpoint "$file" 2>/dev/null)"; then
-        # Source exists, so this is some other failure (permissions, odd FS state, etc.).
-        if [ "$force" = false ]; then
-            echo "rm: cannot remove '$file': failed to determine mountpoint" >&2
+    if [ -d "$file" ] && [ ! -L "$file" ] && [ "$recursive" = false ]; then
+        if [ "$delete_empty_dirs" = false ]; then
+            echo "rm: cannot remove '$file': Is a directory" >&2
+            return 1
         fi
-        return 1
+        if [ -n "$(find "$file" -mindepth 1 -print -quit 2>/dev/null)" ]; then
+            echo "rm: cannot remove '$file': Directory not empty" >&2
+            return 1
+        fi
     fi
 
-    if is_mountpoint_target "$file" "$mp"; then
+    if [ "$interactive_mode" = "always" ] && [ "$force" = false ]; then
+        if prompt_for_target "$file"; then
+            :
+        else
+            case "$?" in
+                1) return 0 ;;
+                *) return 1 ;;
+            esac
+        fi
+    fi
+
+    if ! mp="$(get_mountpoint "$file" 2>/dev/null)"; then
+        echo "rm: cannot remove '$file': failed to determine mountpoint" >&2
+        return 1
+    fi
+    file_real=""
+    if [ ! -L "$file" ]; then
+        file_real="$(realpath -e -- "$file" 2>/dev/null || true)"
+    fi
+    if is_mountpoint_target "$file" "$mp" "$file_real"; then
         echo "rm: refusing to trash filesystem mountpoint '$file' (mounted at '$mp')" >&2
         return 1
     fi
-
+    if is_inside_trash_root "$file" "$mp" "$file_real"; then
+        root="$(trash_root_for_mountpoint "$mp")"
+        echo "rm: refusing to trash path inside the trash root '$file' (root '$root')" >&2
+        return 1
+    fi
     if ! ensure_trash_dir "$mp"; then
-        # Must trash to mountpoint/trash as requested; if we can't create/use it, error.
-        if [ "$force" = false ]; then
-            local dir
-            if [ "$mp" = "/" ]; then dir="/$TRASH_SUBDIR"; else dir="${mp%/}/$TRASH_SUBDIR"; fi
-            echo "rm: cannot move '$file' to '$dir': Permission denied or cannot create trash directory" >&2
-        fi
         return 1
     fi
 
-    local trash_dir="${ensured_trash_dir[$mp]}"
-    local base_name
-    base_name="$(basename -- "$file")"
+    trash_dir="${ensured_trash_dir[$mp]}"
+    if [ -z "$base_name" ]; then
+        echo "rm: cannot remove '$file': invalid empty basename" >&2
+        return 1
+    fi
+    dest="$trash_dir/$base_name"
 
-    # Fast path: try move to plain name without overwriting
-    local dest="$trash_dir/$base_name"
-    if mv -n -- "$file" "$dest" 2>/dev/null; then
+    if mv -nT -- "$file" "$dest" 2>/dev/null && [ ! -e "$file" ] && [ ! -L "$file" ]; then
+        move_succeeded=true
+    fi
+    if [ "$move_succeeded" = false ] && [ ! -e "$file" ] && [ ! -L "$file" ]; then
         return 0
     fi
 
-    # On failure, decide what happened:
-    #  - If destination exists -> collision, retry with timestamp suffix
-    #  - If source missing -> rm-like ENOENT
-    #  - Else -> some other error
-    if [ -e "$dest" ] || [ -L "$dest" ]; then
-        # Collision path: timestamp suffix (ns) + pid, plus bounded retries
-        for _ in {1..10}; do
-            local ts
-            ts="$(date +%Y%m%d-%H%M%S-%N)-$$"
-            local dest2="$trash_dir/${base_name}-${ts}"
-            if mv -n -- "$file" "$dest2" 2>/dev/null; then
-                return 0
-            fi
-            # If source disappeared mid-flight, stop early
-            if [ ! -e "$file" ] && [ ! -L "$file" ]; then
+    if [ "$move_succeeded" = false ] && { [ -e "$dest" ] || [ -L "$dest" ]; }; then
+        for ((attempt = 1; attempt <= 100; attempt++)); do
+            ts="$(date +%Y%m%d-%H%M%S-%N)-$$-$attempt"
+            dest2="$trash_dir/${base_name}-${ts}"
+            if mv -nT -- "$file" "$dest2" 2>/dev/null && [ ! -e "$file" ] && [ ! -L "$file" ]; then
+                dest="$dest2"
+                move_succeeded=true
                 break
             fi
+            if [ ! -e "$file" ] && [ ! -L "$file" ]; then
+                return 0
+            fi
         done
-        if [ "$force" = false ]; then
-            echo "rm: cannot remove '$file': failed to resolve name collision in trash" >&2
-        fi
+    fi
+
+    if [ "$move_succeeded" = false ]; then
+        echo "rm: cannot move '$file' to trash" >&2
         return 1
     fi
-
-    # Not a collision. Check if source exists (slow path only).
-    if [ ! -e "$file" ] && [ ! -L "$file" ]; then
-        if [ "$force" = false ]; then
-            echo "rm: cannot remove '$file': No such file or directory" >&2
-            return 1
-        fi
-        return 0
+    if ! record_manifest_item "$mp" "$file" "$dest"; then
+        return 1
     fi
-
-    # Some other mv failure (permissions, immutable, etc.)
-    if [ "$force" = false ]; then
-        echo "rm: cannot remove '$file': move to trash failed" >&2
+    if [ "$verbose" = true ]; then
+        printf "trashed '%s' -> '%s'\n" "$file" "$dest"
     fi
-    return 1
 }
+
+remove_empty_run_directories() {
+    local mp run_dir first_entry
+    for mp in "${!ensured_run_dir[@]}"; do
+        run_dir="${ensured_run_dir[$mp]}"
+        if [ ! -d "$run_dir/payload" ]; then
+            continue
+        fi
+        first_entry="$(find "$run_dir/payload" -mindepth 1 -print -quit 2>/dev/null || true)"
+        if [ -z "$first_entry" ]; then
+            /bin/rm -rf -- "$run_dir"
+        fi
+    done
+}
+
+if [ "$interactive_mode" = "once" ] && [ "$force" = false ] && { [ "$recursive" = true ] || [ ${#files_to_trash[@]} -gt 3 ]; }; then
+    if ! confirm_once_prompt; then
+        exit 1
+    fi
+fi
 
 if [ "$clean_current_mountpoint" = true ]; then
     if clean_current_trash; then
@@ -695,4 +1228,5 @@ for f in "${files_to_trash[@]}"; do
     fi
 done
 
+remove_empty_run_directories
 exit "$had_error"

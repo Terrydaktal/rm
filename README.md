@@ -6,9 +6,12 @@ A robust, per-mountpoint trash system that transparently replaces the `rm` comma
 
 ```text
 .
-├── fish.config     # Interactive Fish shell alias & sudo wrapper configuration
+├── .bashrc         # Bash alias configuration
+├── fish.config     # Interactive Fish shell alias configuration
 ├── README.md       # Project documentation and guide
-└── trash           # Core Bash script that intercepts rm and manages the trash
+├── tests/
+│   └── test_trash.sh # Namespace-isolated regression and safety tests
+└── trash            # Core Bash script that intercepts rm and manages the trash
 ```
 
 ---
@@ -18,20 +21,21 @@ A robust, per-mountpoint trash system that transparently replaces the `rm` comma
 The `trash` script intercepts `rm` calls and moves files to a local `trash/` directory at the root of the file's respective filesystem mountpoint, rather than deleting them permanently. This ensures that accidental deletions can be recovered while maintaining high performance by avoiding slow cross-device file copies.
 
 ### Core Features
-- **Per-Mountpoint Trashing**: Automatically detects the mountpoint of each target file (e.g., `/`, `/home`, `/mnt/data`) and moves it to a local `trash/` subdirectory on that same device.
-- **Command-by-Command Grouping**: Group all files deleted in a single command execution into a unique master folder inside the trash. The folder is named using the first two deleted items as a prefix, a readable timestamp, the parent deleting application, and the process ID (PID):
-  `([PARENT_APP])[FILE1]+[FILE2]-YYYY-MM-DD_HH-MM-SS-pid-[PID]/`
-- **JSON Audit Logs**: Writes a `metadata.json` file inside each master folder containing:
+- **Per-Mountpoint Trashing**: Automatically detects the mountpoint of each target file (e.g., `/`, `/home`, `/mnt/data`) and moves it to a local `trash/` subdirectory on that same device. The root must be trusted, non-writable by group/other users, and cannot be a symlink.
+- **Command-by-Command Grouping**: Groups files from one command into a private random run folder. The folder uses the first two shortened item names, parent application, timestamp, PID, and a random suffix. Its `payload/` directory contains the moved entries.
+- **JSON Audit Logs**: Writes `metadata.json` and `items.jsonl` inside each run folder. `metadata.json` contains:
   - `command`: The exact shell-escaped command executed.
   - `cwd`: The directory from which it was run.
   - `invoked_by`: The full process parent spawning chain (e.g. `agy <- fish <- xfce4-terminal <- systemd`).
-- **Interactive Clean Confirmation**: Running `trash --clean` will verify your current mountpoint and prompt you to type the exact path of the trash directory to confirm permanent deletion. (Automatically bypassed if standard input/output is not a terminal, or if `-f`/`--force` is specified).
-- **Hindsight App Cleanup**: Running `trash --clean-app APP` permanently deletes trash run folders on the current mountpoint whose folder name starts with `(APP)` or whose `metadata.json` execution chain has `APP` as an exact process name. It uses the same interactive confirmation behavior as `--clean`.
-- **Exceptions Bypass**: Bypasses the trash (permanently deletes using `/bin/rm`) for specific applications. `netmgr` is always bypassed. Additional exceptions are read from the `TRASH_EXCEPTIONS` environment variable (e.g., `set -gx TRASH_EXCEPTIONS "paru makepkg yay"`) and fall back to a default list (`paru`, `makepkg`, `yay`, `trigger.sh`) when unset. The script inspects both process names and full command arguments (`/proc/$PID/cmdline`) to match shell-interpreted scripts in the execution chain.
-- **Argument Unpacking**: Pre-processes and expands combined short flags (e.g. `-rf` -> `-r -f`) to ensure standard flags do not trigger accidental fallback to real `/bin/rm`.
-- **Permissions Preservation**: Moves files using `mv` to preserve exact file ownership, permissions, and metadata.
-- **Safety Fallback**: Unknown options are passed through to the real `/bin/rm`; `--help` and `--version` are handled by the wrapper itself.
+- **Interactive Clean Confirmation**: `trash --clean` and `trash --clean-app APP` require a terminal confirmation unless `-f`/`--force` is explicitly supplied. Noninteractive cleanup without `-f` fails closed.
+- **Hindsight App Cleanup**: `trash --clean-app APP` matches direct run-folder prefixes or exact process names in metadata. It never accepts paths as application names and only deletes paths discovered directly below the trusted trash directory.
+- **Exceptions Bypass**: Bypasses the trash using `/bin/rm` for exact process applications. `netmgr` is always bypassed. `paru`, `makepkg`, `yay`, and `trigger.sh` remain defaults; `TRASH_EXCEPTIONS` adds more entries. Shell script detection examines the executable or script operand, not arbitrary command arguments.
+- **Argument Handling**: Combined short flags such as `-rf` are expanded. Unsupported options fail with status `2` instead of falling through to permanent `/bin/rm`.
+- **Permissions Preservation**: Moves files using `mv` to preserve exact file ownership, permissions, and metadata when the trusted trash root is on the same device.
+- **Collision Safety**: Destination collisions are verified and retried; a source is not reported as deleted until it has actually moved.
 - **Mountpoint Protection**: Refuses to trash a filesystem mountpoint itself, including under `-f`, before creating any trash run folder.
+- **Cleanup Locking**: Normal moves take a shared lock and cleanup takes an exclusive lock, preventing concurrent trash operations from being deleted unexpectedly.
+- **Regression Tests**: `tests/test_trash.sh` runs the safety and behavior checks in an isolated user/mount namespace.
 
 ---
 
@@ -43,7 +47,7 @@ This script is designed to be "opt-in" for interactive user safety. It is **not*
 The following will use the `trash` script instead of permanent deletion:
 
 1.  **Interactive Shell Commands**: When you type `rm file.txt` in a terminal running Bash or Fish.
-2.  **Sudo Commands**: Typing `sudo rm file.txt` is intercepted by a shell wrapper that redirects it to `sudo trash`.
+2.  **Privileged Commands**: The provided shell integrations can route the exact `pkexec rm ...` form through `trash`; the trash root must be trusted for root use.
 3.  **Shell Aliases**: Any user-defined alias that relies on the naked `rm` command within your interactive session.
 
 ### ❌ WHAT IS NOT AFFECTED
@@ -63,20 +67,21 @@ The following will continue to use the **real** `/bin/rm` (permanent deletion) u
 ### Bash (`.bashrc`)
 ```bash
 alias rm='/home/lewis/.local/bin/trash'
-alias sudo='sudo ' # Allows sudo to expand the rm alias
-export TRASH_EXCEPTIONS="paru makepkg yay trigger.sh"
+alias pkexec='pkexec ' # Allows pkexec to expand the rm alias
+# TRASH_EXCEPTIONS adds entries to the built-in exception list.
+export TRASH_EXCEPTIONS="custom-app"
 ```
 
 ### Fish (`fish.config`)
 ```fish
 alias rm '/home/lewis/.local/bin/trash'
-set -gx TRASH_EXCEPTIONS "paru makepkg yay trigger.sh"
+set -gx TRASH_EXCEPTIONS custom-app
 
-function sudo
+function pkexec
     if test "$argv[1]" = "rm"
-        command sudo /home/lewis/.local/bin/trash $argv[2..-1]
+        command pkexec /home/lewis/.local/bin/trash $argv[2..-1]
     else
-        command sudo $argv
+        command pkexec $argv
     end
 end
 ```
@@ -84,8 +89,23 @@ end
 ---
 
 ## Operation Notes
-- **Recursive Deletion**: The `-r` and `-R` flags are accepted but ignored; since `mv` can move directories, the script naturally handles recursive "deletion" by moving the entire tree to the trash.
-- **Force Flag**: The `-f` flag suppresses error messages (e.g., if a file doesn't exist) and bypasses clean prompts, mimicking standard `rm` behavior.
-- **Trash Cleanup**: `trash --clean` clears all entries from the current mountpoint's trash directory. It requires path confirmation when run interactively.
-- **App Cleanup**: `trash --clean-app APP` removes grouped trash runs whose folder name starts with `(APP)` or whose recorded `invoked_by` chain has `APP` as an exact process name; use `trash -f --clean-app APP` to skip the interactive prompt.
+- **Recursive Deletion**: `-r` and `-R` are required for directories. `-d`/`--dir` handles empty directories without recursion.
+- **Interactive Flags**: `-i` prompts per target, `-I` prompts once for recursive or large operations, and `-v` reports successful moves.
+- **Force Flag**: `-f` suppresses missing-file diagnostics and bypasses cleanup prompts. Permission, storage, validation, and move failures are still reported.
+- **Trash Cleanup**: `trash --clean` clears entries from the current mountpoint's trusted trash directory, preserves its lock/marker files, and refuses to cross nested filesystems.
+- **App Cleanup**: `trash --clean-app APP` removes matching direct run folders only. APP must be an exact safe process name; use `trash -f --clean-app APP` to skip the interactive prompt.
+- **Custom Roots**: `TRASH_SUBDIR` accepts one safe directory name. A pre-existing custom root must contain a private `.trash-root` marker; arbitrary paths such as `.`, `/`, `..`, or `tmp` are rejected or fail trust validation.
+- **Privileged Use**: Root operations require a root-owned trash root with no group/other write access. A user-owned `/trash` is intentionally rejected when invoked as root.
 - **Mountpoint Targets**: Direct attempts to trash `/`, `/media/...` mount roots, or any other filesystem mountpoint fail with exit status `1` and a clear diagnostic. The mountpoint and its contents are not changed.
+
+## Testing
+
+Run the isolated regression suite from the project root:
+
+```bash
+env -u TRASH_EXCEPTIONS ./tests/test_trash.sh
+```
+
+It requires `unshare`, `mount`, `jq`, and the standard GNU file utilities. The
+suite mounts a temporary filesystem in a private namespace and does not modify
+the host trash directory.
