@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -euo pipefail
 
 # Trash-per-mountpoint:
@@ -18,7 +18,7 @@ set -euo pipefail
 
 # --- CONFIG ---
 TRASH_SUBDIR="${TRASH_SUBDIR:-trash}" # single safe directory name at mountpoint
-TRASH_VERSION="0.2.0"
+TRASH_VERSION="0.3.0"
 
 if [[ ! "$TRASH_SUBDIR" =~ ^[A-Za-z0-9._-]+$ || "$TRASH_SUBDIR" == "." || "$TRASH_SUBDIR" == ".." ]]; then
     echo "rm: invalid TRASH_SUBDIR '$TRASH_SUBDIR': use one safe directory name" >&2
@@ -38,14 +38,14 @@ exceptions_array+=("${hardcoded_exceptions_array[@]}")
 
 force=false
 recursive=false
-delete_empty_dirs=false
 interactive_mode=""
 verbose=false
 clean_current_mountpoint=false
-clean_app=""
+clean_app_mode=false
 show_help=false
 show_version=false
 files_to_trash=()
+clean_apps=()
 
 orig_argv=("$@")
 
@@ -59,7 +59,8 @@ NAME
 SYNOPSIS
     $prog [OPTIONS] FILE...
     $prog --clean [-f]
-    $prog --clean-app APP [-f]
+    $prog --clean PATH... [-f]
+    $prog --clean-app APP... [-f]
     $prog --help
     $prog --version
 
@@ -81,10 +82,11 @@ OPTIONS
         permission, storage, or move failures.
 
     -r, -R, --recursive
-        Required to move non-empty directories as whole trees.
+        Accepted for rm compatibility. Directories are always moved as whole
+        trees without recursive traversal.
 
     -d, --dir
-        Remove empty directories without recursion.
+        Accepted for rm compatibility. Directories do not require this option.
 
     -i, --interactive
         Prompt before moving each target.
@@ -102,17 +104,24 @@ OPTIONS
         Accepted as no-op compatibility options. Mountpoint and trash-root
         protections always remain active.
 
-    --clean
-        Permanently delete all entries in the current mountpoint's trash
-        directory. Requires confirmation in an interactive terminal unless -f
-        is supplied.
+    --one-file-system
+        Accepted as a compatibility safety option. Normal trashing renames each
+        target on its own filesystem instead of traversing it, and permanent
+        cleanup always passes --one-file-system to /bin/rm.
 
-    --clean-app APP
+    --clean
+        With no path, permanently delete all entries in the current mountpoint's
+        trash directory. With paths, permanently delete exactly those files,
+        symlinks, or directories from one trusted trash root. Requires
+        confirmation in an interactive terminal unless -f is supplied.
+
+    --clean-app APP...
         Permanently delete grouped trash runs on the current mountpoint whose
-        folder name starts with (APP), or whose metadata invoked_by chain
-        contains APP as an exact process name. The scan checks names first and
-        only reads metadata for non-matching names. Requires confirmation in an
-        interactive terminal unless -f is supplied.
+        folder name starts with any (APP), or whose metadata invoked_by chain
+        contains any APP as an exact process name. All apps are matched in one
+        scan. The scan checks names first and only reads metadata for non-matching
+        names. Requires confirmation in an interactive terminal unless -f is
+        supplied.
 
     --help
         Show this help text and exit.
@@ -128,14 +137,18 @@ OPERATION
     3. The run folder label prefers codex or agy when either appears in the
        parent execution chain; otherwise it uses the immediate parent process.
     4. Normal trashing uses shared locking; cleanup uses an exclusive lock.
-    5. Unknown and unsupported options fail closed with status 2. The real
-       /bin/rm is used only for exception bypasses and no-operand diagnostics.
+    5. Path cleanup validates every target before deleting any, requires one
+       trusted trash root, and protects root control files.
+    6. Unknown and unsupported options fail closed with status 2. The real
+       /bin/rm is used only for cleanup, exception bypasses, and no-operand
+       diagnostics.
 
 EXAMPLES
     $prog file.txt dir
     $prog -rf build-cache
     $prog --clean
-    $prog -f --clean-app agy
+    $prog --clean '/trash/(agy)run/payload/one' '/trash/(agy)run/payload/two'
+    $prog -f --clean-app agy codex
 
 FILES
     MOUNTPOINT/TRASH_SUBDIR/<run>/metadata.json
@@ -166,6 +179,10 @@ PATHS
 
 SECURITY NOTES
     Cleanup modes use permanent deletion via /bin/rm.
+    Path cleanup refuses the trash root itself, nested mountpoints, .trash.lock,
+    .trash-root, symlinked-parent escapes, mixed trash roots, and paths outside
+    the trusted trash root. A final symlink is removed without following its
+    target.
     Unsupported options never fall through to permanent /bin/rm.
     Filesystem mountpoints are refused as trash targets before any trash folder
     is created, including when -f or --force is supplied.
@@ -355,7 +372,6 @@ while [ $# -gt 0 ]; do
             shift
             ;;
         -d | --dir)
-            delete_empty_dirs=true
             shift
             ;;
         -i | --interactive)
@@ -390,34 +406,37 @@ while [ $# -gt 0 ]; do
             exit 2
             ;;
         --one-file-system)
-            echo "rm: unsupported --one-file-system cannot be safely emulated by trash" >&2
-            exit 2
+            # Trashing does not recursively traverse the target, and cleanup
+            # independently enforces this boundary with the real rm.
+            shift
             ;;
         --clean)
             clean_current_mountpoint=true
             shift
             ;;
         --clean-app)
-            if [ $# -lt 2 ] || [ -z "$2" ] || [[ "$2" == -* ]]; then
-                echo "rm: option '--clean-app' requires an app name" >&2
-                exit 2
-            fi
-            clean_app="$2"
-            shift 2
+            clean_app_mode=true
+            shift
             ;;
         --clean-app=*)
-            clean_app="${1#--clean-app=}"
-            if [ -z "$clean_app" ]; then
+            clean_app_mode=true
+            clean_app_value="${1#--clean-app=}"
+            if [ -z "$clean_app_value" ]; then
                 echo "rm: option '--clean-app' requires an app name" >&2
                 exit 2
             fi
+            clean_apps+=("$clean_app_value")
             shift
             ;;
         --)
             shift
-            # everything after -- is a path
+            # Everything after -- belongs to the active operand mode.
             while [ $# -gt 0 ]; do
-                files_to_trash+=("$1")
+                if [ "$clean_app_mode" = true ]; then
+                    clean_apps+=("$1")
+                else
+                    files_to_trash+=("$1")
+                fi
                 shift
             done
             ;;
@@ -426,30 +445,40 @@ while [ $# -gt 0 ]; do
             exit 2
             ;;
         *)
-            files_to_trash+=("$1")
+            if [ "$clean_app_mode" = true ]; then
+                clean_apps+=("$1")
+            else
+                files_to_trash+=("$1")
+            fi
             shift
             ;;
     esac
 done
 
-if [ "$clean_current_mountpoint" = true ] && [ ${#files_to_trash[@]} -gt 0 ]; then
-    echo "rm: cannot use --clean with file operands" >&2
-    exit 2
-fi
-
-if [ "$clean_current_mountpoint" = true ] && [ -n "$clean_app" ]; then
+if [ "$clean_current_mountpoint" = true ] && [ "$clean_app_mode" = true ]; then
     echo "rm: cannot combine --clean and --clean-app" >&2
     exit 2
 fi
 
-if [ -n "$clean_app" ] && [ ${#files_to_trash[@]} -gt 0 ]; then
-    echo "rm: cannot use --clean-app with file operands" >&2
+if [ "$clean_app_mode" = true ] && [ ${#clean_apps[@]} -eq 0 ]; then
+    echo "rm: option '--clean-app' requires at least one app name" >&2
     exit 2
 fi
 
-if [ -n "$clean_app" ] && [[ ! "$clean_app" =~ ^[A-Za-z0-9._-]+$ ]]; then
-    echo "rm: invalid application name '$clean_app'" >&2
-    exit 2
+if [ "$clean_app_mode" = true ]; then
+    declare -A seen_clean_apps=()
+    unique_clean_apps=()
+    for clean_app_value in "${clean_apps[@]}"; do
+        if [[ ! "$clean_app_value" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            echo "rm: invalid application name '$clean_app_value'" >&2
+            exit 2
+        fi
+        if [[ -z "${seen_clean_apps[$clean_app_value]:-}" ]]; then
+            seen_clean_apps[$clean_app_value]=1
+            unique_clean_apps+=("$clean_app_value")
+        fi
+    done
+    clean_apps=("${unique_clean_apps[@]}")
 fi
 
 if [ "$show_help" = true ]; then
@@ -462,9 +491,9 @@ if [ "$show_version" = true ]; then
     exit 0
 fi
 
-# Preserve normal rm's no-operand diagnostics and -f behavior.  This is the
-# only non-exception path that invokes /bin/rm.
-if [ "$clean_current_mountpoint" = false ] && [ -z "$clean_app" ] && [ ${#files_to_trash[@]} -eq 0 ]; then
+# Preserve normal rm's no-operand diagnostics and -f behavior without creating
+# an empty trash run.
+if [ "$clean_current_mountpoint" = false ] && [ "$clean_app_mode" = false ] && [ ${#files_to_trash[@]} -eq 0 ]; then
     exec /bin/rm "${orig_argv[@]}"
 fi
 
@@ -616,8 +645,29 @@ is_inside_trash_root() {
     return 1
 }
 
+is_android=false
+if [ -d "/system/bin" ] && { [ -d "/data/data/com.termux" ] || [ -d "/data/local/tmp" ]; }; then
+    is_android=true
+fi
+
 trash_root_for_mountpoint() {
     local mp="$1"
+    if [ "$is_android" = true ]; then
+        if [[ "$mp" == /storage* || "$mp" == /sdcard* ]]; then
+            printf '/sdcard/.%s\n' "$TRASH_SUBDIR"
+            return 0
+        elif [[ "$mp" == /data/local/tmp* || "$EUID" -eq 2000 ]]; then
+            if [ -d "/data/local/tmp/termux-sudo" ]; then
+                printf '/data/local/tmp/termux-sudo/%s\n' "$TRASH_SUBDIR"
+            else
+                printf '/data/local/tmp/.%s\n' "$TRASH_SUBDIR"
+            fi
+            return 0
+        elif [ -n "${HOME:-}" ] && [ -d "$HOME" ]; then
+            printf '%s/.%s\n' "$HOME" "$TRASH_SUBDIR"
+            return 0
+        fi
+    fi
     if [ "$mp" = "/" ]; then
         printf '/%s\n' "$TRASH_SUBDIR"
     else
@@ -646,20 +696,22 @@ check_trash_root() {
         echo "rm: cannot inspect mountpoint '$mp'" >&2
         return 1
     }
-    if [ "$device" != "$mp_device" ]; then
+    if [ "$is_android" = false ] && [ "$device" != "$mp_device" ]; then
         echo "rm: refusing trash root '$root': it is on a different filesystem" >&2
         return 1
     fi
     numeric_mode=$((8#$mode))
-    if ((numeric_mode & 0022)); then
-        echo "rm: refusing trash root '$root': group/other write permission is unsafe" >&2
-        return 1
+    if [ "$is_android" = false ] || [[ "$root" != /sdcard* && "$root" != /storage* ]]; then
+        if ((numeric_mode & 0022)); then
+            echo "rm: refusing trash root '$root': group/other write permission is unsafe" >&2
+            return 1
+        fi
     fi
     if [ "$EUID" -eq 0 ] && [ "$owner" -ne 0 ]; then
         echo "rm: refusing root operation: trash root '$root' is not root-owned" >&2
         return 1
     fi
-    if [ "$EUID" -ne 0 ] && [ "$owner" -ne 0 ] && [ "$owner" -ne "$EUID" ]; then
+    if [ "$is_android" = false ] && [ "$EUID" -ne 0 ] && [ "$owner" -ne 0 ] && [ "$owner" -ne "$EUID" ]; then
         echo "rm: refusing trash root '$root': it is owned by another user" >&2
         return 1
     fi
@@ -723,16 +775,18 @@ validate_trash_dir() {
         echo "rm: cannot inspect trash directory '$dir'" >&2
         return 1
     fi
-    if [ "$owner" -ne "$EUID" ]; then
+    if [ "$is_android" = false ] && [ "$owner" -ne "$EUID" ]; then
         echo "rm: refusing trash directory '$dir': it is not owned by the current user" >&2
         return 1
     fi
     numeric_mode=$((8#$mode))
-    if ((numeric_mode & 0022)); then
-        echo "rm: refusing trash directory '$dir': group/other write permission is unsafe" >&2
-        return 1
+    if [ "$is_android" = false ] || [[ "$dir" != /sdcard* && "$dir" != /storage* ]]; then
+        if ((numeric_mode & 0022)); then
+            echo "rm: refusing trash directory '$dir': group/other write permission is unsafe" >&2
+            return 1
+        fi
     fi
-    if [ "$(stat -c '%d' -- "$dir")" != "$(stat -c '%d' -- "$mp")" ]; then
+    if [ "$is_android" = false ] && [ "$(stat -c '%d' -- "$dir")" != "$(stat -c '%d' -- "$mp")" ]; then
         echo "rm: refusing trash directory '$dir': it is on a different filesystem" >&2
         return 1
     fi
@@ -849,6 +903,112 @@ confirm_cleanup_prompt() {
     fi
 }
 
+clean_trash_paths() {
+    local requested path parent base parent_real target mp target_mp root root_real target_real
+    local batch_mp=""
+    local expected prompt
+    local -a targets=()
+    local -A seen_targets=()
+
+    for requested; do
+        path="$requested"
+        while [[ "$path" == */ && "$path" != "/" ]]; do
+            path="${path%/}"
+        done
+        base="${path##*/}"
+        case "$base" in
+            "" | . | ..)
+                echo "rm: refusing invalid cleanup path '$requested'" >&2
+                return 1
+                ;;
+        esac
+
+        parent="$(dirname -- "$path")"
+        if ! parent_real="$(realpath -e -- "$parent" 2>/dev/null)"; then
+            echo "rm: cannot clean '$requested': parent directory does not exist" >&2
+            return 1
+        fi
+        target="${parent_real%/}/$base"
+
+        if ! mp="$(get_mountpoint "$parent_real" 2>/dev/null)"; then
+            echo "rm: cannot clean '$requested': failed to determine mountpoint" >&2
+            return 1
+        fi
+        if [ -n "$batch_mp" ] && [ "$mp" != "$batch_mp" ]; then
+            echo "rm: refusing --clean paths from multiple trash roots" >&2
+            return 1
+        fi
+        batch_mp="$mp"
+
+        root="$(trash_root_for_mountpoint "$mp")"
+        if ! check_trash_root "$mp" "$root" || ! validate_trash_dir "$mp"; then
+            return 1
+        fi
+        if ! root_real="$(realpath -e -- "$root" 2>/dev/null)"; then
+            echo "rm: cannot resolve trash root '$root'" >&2
+            return 1
+        fi
+        case "$target" in
+            "$root_real")
+                echo "rm: refusing to clean the trash root itself '$target'" >&2
+                return 1
+                ;;
+            "$root_real/.trash.lock" | "$root_real/.trash-root")
+                echo "rm: refusing to clean protected trash control file '$target'" >&2
+                return 1
+                ;;
+            "$root_real"/*) ;;
+            *)
+                echo "rm: refusing cleanup path outside trusted trash root '$target'" >&2
+                return 1
+                ;;
+        esac
+
+        if [ ! -e "$target" ] && [ ! -L "$target" ]; then
+            if [ "$force" = false ]; then
+                echo "rm: cannot clean '$target': No such file or directory" >&2
+                return 1
+            fi
+        else
+            if ! target_mp="$(get_mountpoint "$target" 2>/dev/null)"; then
+                echo "rm: cannot clean '$target': failed to determine target mountpoint" >&2
+                return 1
+            fi
+            target_real=""
+            if [ ! -L "$target" ]; then
+                target_real="$(realpath -e -- "$target" 2>/dev/null || true)"
+            fi
+            if is_mountpoint_target "$target" "$target_mp" "$target_real" || [ "$target_mp" != "$mp" ]; then
+                echo "rm: refusing to clean nested filesystem target '$target'" >&2
+                return 1
+            fi
+        fi
+
+        if [[ -z "${seen_targets[$target]:-}" ]]; then
+            seen_targets[$target]=1
+            targets+=("$target")
+        fi
+    done
+
+    if ! acquire_trash_lock "$batch_mp" exclusive; then
+        return 1
+    fi
+    if [ ${#targets[@]} -eq 1 ]; then
+        expected="${targets[0]}"
+        prompt="WARNING: type '$expected' to permanently delete it: "
+    else
+        expected="DELETE ${#targets[@]} PATHS"
+        prompt="WARNING: type '$expected' to permanently delete ${#targets[@]} paths: "
+    fi
+    if ! confirm_cleanup_prompt "$prompt" "$expected"; then
+        return 1
+    fi
+    if ! /bin/rm --one-file-system -rf -- "${targets[@]}"; then
+        echo "rm: cannot clean one or more trash paths: deletion failed" >&2
+        return 1
+    fi
+}
+
 clean_current_trash() {
     local mp root dir trash_device
     if ! mp="$(get_mountpoint "." 2>/dev/null)"; then
@@ -916,8 +1076,9 @@ clean_current_trash() {
     fi
 }
 
-clean_trash_by_app() {
-    local app="$1"
+clean_trash_by_apps() {
+    local -a apps=("$@")
+    local app_list="${apps[*]}"
     local mp root dir matches_file metadata_paths match_count scan_failed
     if ! mp="$(get_mountpoint "." 2>/dev/null)"; then
         echo "rm: cannot clean trash: failed to determine mountpoint for '$PWD'" >&2
@@ -940,40 +1101,54 @@ clean_trash_by_app() {
     fi
 
     if ! matches_file="$(mktemp)" || ! metadata_paths="$(mktemp)"; then
-        echo "rm: cannot clean trash entries for app '$app': failed to create temporary files" >&2
+        echo "rm: cannot clean trash entries for apps '$app_list': failed to create temporary files" >&2
         return 1
     fi
     scan_failed=false
 
     if ! find "$dir" -xdev -mindepth 1 -maxdepth 1 -type d -exec sh -c '
-        app="$1"
+        app_list="$1"
         shift
+        set -f
         for run_dir do
             base="${run_dir##*/}"
-            case "$base" in
-                "($app)"*)
-                    printf "%s\0" "$run_dir" >&3
-                    continue
-                    ;;
-            esac
+            matched=false
+            for app in $app_list; do
+                case "$base" in
+                    "($app)"*)
+                        printf "%s\0" "$run_dir" >&3
+                        matched=true
+                        break
+                        ;;
+                esac
+            done
+            if [ "$matched" = true ]; then
+                continue
+            fi
             metadata="$run_dir/metadata.json"
             if [ -f "$metadata" ]; then
                 printf "%s\0" "$metadata" >&4
             fi
         done
-    ' sh "$app" {} + 3>"$matches_file" 4>"$metadata_paths"; then
+    ' sh "$app_list" {} + 3>"$matches_file" 4>"$metadata_paths"; then
         scan_failed=true
     fi
 
     # shellcheck disable=SC2016 # $0 belongs to awk, not the shell.
-    if [ "$scan_failed" = false ] && ! xargs -0 -r awk -v app="$app" '
+    if [ "$scan_failed" = false ] && ! xargs -0 -r awk -v app_list="$app_list" '
+        BEGIN {
+            app_count = split(app_list, apps, / /)
+            for (app_index = 1; app_index <= app_count; app_index++) {
+                requested_apps[apps[app_index]] = 1
+            }
+        }
         /^[[:space:]]*"invoked_by"[[:space:]]*:/ {
             line = $0
             sub(/^[^:]*:[[:space:]]*"/, "", line)
             sub(/"[[:space:]]*,?[[:space:]]*$/, "", line)
             count = split(line, chain, /[[:space:]]*<-[[:space:]]*/)
             for (i = 1; i <= count; i++) {
-                if (chain[i] == app) {
+                if (chain[i] in requested_apps) {
                     run = FILENAME
                     sub(/\/metadata\.json$/, "", run)
                     printf "%s%c", run, 0
@@ -988,7 +1163,7 @@ clean_trash_by_app() {
     /bin/rm -f -- "$metadata_paths"
     if [ "$scan_failed" = true ]; then
         /bin/rm -f -- "$matches_file"
-        echo "rm: cannot clean trash entries for app '$app': scan failed" >&2
+        echo "rm: cannot clean trash entries for apps '$app_list': scan failed" >&2
         return 1
     fi
 
@@ -1000,14 +1175,14 @@ clean_trash_by_app() {
     else
         if ! match_count="$(tr -cd '\0' <"$matches_file" | wc -c)"; then
             /bin/rm -f -- "$matches_file"
-            echo "rm: cannot count trash entries for app '$app'" >&2
+            echo "rm: cannot count trash entries for apps '$app_list'" >&2
             return 1
         fi
         if [ "$match_count" -eq 0 ]; then
             /bin/rm -f -- "$matches_file"
             return 0
         fi
-        if ! confirm_cleanup_prompt "WARNING: type '$app' to permanently delete $match_count trash run(s): " "$app"; then
+        if ! confirm_cleanup_prompt "WARNING: type '$app_list' to permanently delete $match_count trash run(s): " "$app_list"; then
             /bin/rm -f -- "$matches_file"
             return 1
         fi
@@ -1015,7 +1190,7 @@ clean_trash_by_app() {
 
     if ! xargs -0 -r /bin/rm --one-file-system -rf -- <"$matches_file"; then
         /bin/rm -f -- "$matches_file"
-        echo "rm: cannot clean trash entries for app '$app': deletion failed" >&2
+        echo "rm: cannot clean trash entries for apps '$app_list': deletion failed" >&2
         return 1
     fi
 
@@ -1102,17 +1277,6 @@ trash_one() {
             return 1
             ;;
     esac
-
-    if [ -d "$file" ] && [ ! -L "$file" ] && [ "$recursive" = false ]; then
-        if [ "$delete_empty_dirs" = false ]; then
-            echo "rm: cannot remove '$file': Is a directory" >&2
-            return 1
-        fi
-        if [ -n "$(find "$file" -mindepth 1 -print -quit 2>/dev/null)" ]; then
-            echo "rm: cannot remove '$file': Directory not empty" >&2
-            return 1
-        fi
-    fi
 
     if [ "$interactive_mode" = "always" ] && [ "$force" = false ]; then
         if prompt_for_target "$file"; then
@@ -1208,14 +1372,18 @@ if [ "$interactive_mode" = "once" ] && [ "$force" = false ] && { [ "$recursive" 
 fi
 
 if [ "$clean_current_mountpoint" = true ]; then
-    if clean_current_trash; then
+    if [ ${#files_to_trash[@]} -gt 0 ]; then
+        if clean_trash_paths "${files_to_trash[@]}"; then
+            exit 0
+        fi
+    elif clean_current_trash; then
         exit 0
     fi
     exit 1
 fi
 
-if [ -n "$clean_app" ]; then
-    if clean_trash_by_app "$clean_app"; then
+if [ "$clean_app_mode" = true ]; then
+    if clean_trash_by_apps "${clean_apps[@]}"; then
         exit 0
     fi
     exit 1

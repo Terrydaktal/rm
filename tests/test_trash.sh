@@ -58,12 +58,10 @@ check duplicate_b_moved test ! -e "$work/b/item"
 check duplicate_payloads test "$(find /tmp/trash -path '*/payload/item*' -type f | wc -l)" -eq 2
 
 mkdir -p "$work/not-recursive"
-set +e
-"$tool" "$work/not-recursive" >/dev/null 2>&1
-status=$?
-set -e
-check directory_requires_recursive test "$status" -eq 1
-check directory_not_moved_without_recursive test -d "$work/not-recursive"
+printf nested >"$work/not-recursive/payload"
+"$tool" "$work/not-recursive" >/dev/null
+check directory_without_recursive_is_moved test ! -e "$work/not-recursive"
+check directory_without_recursive_keeps_contents test -f "$(find /tmp/trash -path '*/payload/not-recursive/payload' -type f -print -quit)"
 
 mkdir -p "$work/traversal-form"
 set +e
@@ -80,6 +78,12 @@ status=$?
 set -e
 check unsupported_option_fails_closed test "$status" -eq 2
 check unsupported_source_remains test -e "$work/unsupported"
+
+mkdir -p "$work/one-file-system"
+printf guarded >"$work/one-file-system/payload"
+"$tool" -rf --one-file-system "$work/one-file-system" >/dev/null
+check one_file_system_is_accepted test ! -e "$work/one-file-system"
+check one_file_system_moves_directory test -f "$(find /tmp/trash -path '*/payload/one-file-system/payload' -type f -print -quit)"
 
 printf interactive >"$work/interactive"
 printf 'y\n' | "$tool" -i "$work/interactive" >/dev/null
@@ -124,9 +128,59 @@ set -e
 check noninteractive_clean_requires_force test "$status" -eq 1
 check noninteractive_clean_preserves_data test -f "$(find /tmp/trash -path '*/payload/one' -type f -print -quit)"
 
+mkdir -p "/tmp/trash/single run/payload"
+printf delete >"/tmp/trash/single run/payload/delete-me"
+printf delete >"/tmp/trash/single run/payload/delete-me-too"
+printf keep >"/tmp/trash/single run/payload/keep-me"
+set +e
+(cd /tmp && "$tool" --clean "/tmp/trash/single run/payload/delete-me" "/tmp/trash/single run/payload/delete-me-too" </dev/null >/dev/null 2>&1)
+status=$?
+set -e
+check noninteractive_single_clean_requires_force test "$status" -eq 1
+check noninteractive_single_clean_preserves_target test -f "/tmp/trash/single run/payload/delete-me"
+(cd /tmp && "$tool" -f --clean "/tmp/trash/single run/payload/delete-me" "/tmp/trash/single run/payload/delete-me-too" "/tmp/trash/single run/payload/delete-me" >/dev/null)
+check path_clean_deletes_first_exact_path test ! -e "/tmp/trash/single run/payload/delete-me"
+check path_clean_deletes_second_exact_path test ! -e "/tmp/trash/single run/payload/delete-me-too"
+check path_clean_preserves_sibling test -f "/tmp/trash/single run/payload/keep-me"
+
+printf outside >"$work/outside-clean"
+printf validate-first >"/tmp/trash/single run/payload/validate-first"
+set +e
+(cd /tmp && "$tool" -f --clean "/tmp/trash/single run/payload/validate-first" "$work/outside-clean" >/dev/null 2>&1)
+status=$?
+set -e
+check single_clean_rejects_outside_path test "$status" -eq 1
+check single_clean_preserves_outside_path test -f "$work/outside-clean"
+check path_clean_validates_all_before_deleting test -f "/tmp/trash/single run/payload/validate-first"
+
+ln -s "$work/outside-clean" "/tmp/trash/single link"
+(cd /tmp && "$tool" -f --clean "/tmp/trash/single link" >/dev/null)
+check single_clean_removes_final_symlink test ! -L "/tmp/trash/single link"
+check single_clean_does_not_follow_final_symlink test -f "$work/outside-clean"
+
+set +e
+(cd /tmp && "$tool" -f --clean /tmp/trash >/dev/null 2>&1)
+status=$?
+set -e
+check single_clean_rejects_trash_root test "$status" -eq 1
+check single_clean_preserves_trash_root test -d /tmp/trash
+
+set +e
+(cd /tmp && "$tool" -f --clean /tmp/trash/.trash.lock >/dev/null 2>&1)
+status=$?
+set -e
+check single_clean_rejects_lock test "$status" -eq 1
+check single_clean_preserves_lock test -f /tmp/trash/.trash.lock
+
 mkdir -p /tmp/trash/nested-mount
 mount -t tmpfs tmpfs /tmp/trash/nested-mount
 printf protected > /tmp/trash/nested-mount/protected
+set +e
+(cd /tmp && "$tool" -f --clean /tmp/trash/nested-mount >/dev/null 2>&1)
+status=$?
+set -e
+check single_clean_rejects_nested_mount test "$status" -eq 1
+check single_clean_preserves_nested_mount test -f /tmp/trash/nested-mount/protected
 set +e
 (cd /tmp && "$tool" -f --clean >/dev/null 2>&1)
 status=$?
@@ -145,15 +199,21 @@ check custom_root_preserves_marker test -f /tmp/custom-root/.trash-root
 check clean_removes_hidden_entries test ! -e /tmp/custom-root/.hidden
 
 app=auditvictim
-mkdir -p /tmp/trash/'(other)run' /tmp/trash/'(auditvictim)run' "$work/$app"
+app2=secondvictim
+app3=thirdvictim
+mkdir -p /tmp/trash/'(other)run' /tmp/trash/'(auditvictim)run' /tmp/trash/'(secondvictim)run' /tmp/trash/'(third-other)run' "$work/$app"
 printf '{\n  "invoked_by": "auditvictim"\n}\n' > /tmp/trash/'(other)run'/metadata.json
 printf '{\n  "invoked_by": "other"\n}\n' > /tmp/trash/'(auditvictim)run'/metadata.json
+printf '{\n  "invoked_by": "other"\n}\n' > /tmp/trash/'(secondvictim)run'/metadata.json
+printf '{\n  "invoked_by": "shell <- thirdvictim <- systemd"\n}\n' > /tmp/trash/'(third-other)run'/metadata.json
 printf matching > /tmp/trash/'(auditvictim)run'/payload
 printf outside >"$work/$app/payload"
-(cd /tmp && "$tool" -f --clean-app "$app" >/dev/null)
+(cd /tmp && "$tool" --clean-app "$app" "$app2" "$app3" -f >/dev/null)
 check clean_app_does_not_delete_cwd test -d "$work/$app"
 check clean_app_deletes_name_match test ! -e /tmp/trash/'(auditvictim)run'
 check clean_app_deletes_metadata_match test ! -e /tmp/trash/'(other)run'
+check clean_apps_delete_second_name_match test ! -e /tmp/trash/'(secondvictim)run'
+check clean_apps_delete_third_metadata_match test ! -e /tmp/trash/'(third-other)run'
 
 mkdir -p /tmp/trash/'(paru)run'/payload
 printf '{
