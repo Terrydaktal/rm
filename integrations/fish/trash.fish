@@ -1,7 +1,7 @@
-# rm -> trash (do NOT use --save here)
+# Map rm to the installed trash binary (do not use --save here).
 alias rm '/home/lewis/.local/bin/trash'
 
-# sudo wrapper: if "sudo rm ..." then use trash as root
+# Route the exact "sudo rm ..." form through trash as root.
 function sudo
     if test (count $argv) -ge 1; and test "$argv[1]" = "rm"
         command sudo /home/lewis/.local/bin/trash $argv[2..-1]

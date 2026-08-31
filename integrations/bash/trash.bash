@@ -1,6 +1,6 @@
 # shellcheck shell=bash
-# 1. Map 'rm' to your specific script path
+# Map rm to the installed trash binary.
 alias rm='/home/lewis/.local/bin/trash'
 
-# 2. Allow sudo to see the alias
+# Allow Bash to expand rm after sudo.
 alias sudo='sudo '

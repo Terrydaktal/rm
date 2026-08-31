@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+      - name: Install shell test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq shellcheck shfmt uidmap
+          grep -q "^${USER}:" /etc/subuid || echo "${USER}:100000:65536" | sudo tee -a /etc/subuid
+          grep -q "^${USER}:" /etc/subgid || echo "${USER}:100000:65536" | sudo tee -a /etc/subgid
+      - name: Format
+        run: |
+          cargo fmt --all -- --check
+          shfmt -d tests/e2e.sh tests/e2e/*.sh tests/scale.sh integrations/bash/trash.bash
+      - name: Lint
+        run: |
+          cargo clippy --all-targets --all-features -- -D warnings
+          shellcheck tests/e2e.sh tests/e2e/*.sh tests/scale.sh integrations/bash/trash.bash reference/trash.bash
+      - name: Unit tests
+        run: cargo test --all-targets
+      - name: Namespace safety tests
+        run: |
+          cargo build
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          env -u TRASH_EXCEPTIONS ./tests/e2e.sh
+      - name: Scale tests
+        run: |
+          cargo build --release
+          TRASH_BIN="$PWD/target/release/trash" ./tests/scale.sh
